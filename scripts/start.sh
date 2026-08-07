@@ -82,9 +82,16 @@ while [ "$i" -lt 60 ]; do
   if ! kill -0 "$pid" 2>/dev/null; then
     break
   fi
-  if command -v curl >/dev/null 2>&1 && curl -kfsS --max-time 2 "$scheme://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-    ready=1
-    break
+  if command -v curl >/dev/null 2>&1; then
+    health=$(curl -kfsS --max-time 2 "$scheme://127.0.0.1:$PORT/health" 2>/dev/null || true)
+    # Verify BOTH that our pid is still alive AND the responder looks like
+    # the tunnel (health JSON with a "status" field). A foreign process
+    # squatting on the port answers 200 too - without this, start.sh would
+    # print "Started" while the real tunnel died with Address already in use.
+    if kill -0 "$pid" 2>/dev/null && printf '%s' "$health" | grep -q '"status"'; then
+      ready=1
+      break
+    fi
   fi
   sleep 0.5
   i=$((i + 1))
