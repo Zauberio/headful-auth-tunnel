@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import queue
+import socket
 import secrets
 import ssl
 import threading
@@ -796,8 +797,13 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             self.connection.settimeout(config.socket_timeout_seconds)
 
         def log_message(self, fmt: str, *args) -> None:
-            path = urlsplit(self.path).path
-            LOGGER.info("%s %s %s", self.client_address[0], self.command, path)
+            # self.path AND self.command may not exist when parse_request fails
+            # (request-line timeout, malformed line) - the base class then
+            # calls log_error, which routed here and crashed with
+            # AttributeError, emitting a pre-auth exception storm for every
+            # trickled/malformed request.
+            path = urlsplit(getattr(self, "path", "")).path
+            LOGGER.info("%s %s %s", self.client_address[0], getattr(self, "command", "-"), path)
 
         def _headers(
             self,
@@ -915,6 +921,11 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             return "; ".join(parts)
 
         def _handle_error(self, exc: BaseException) -> None:
+            # After a body/request error (timeout while reading the body,
+            # oversized body, malformed framing) unread bytes may remain in
+            # the socket. Force-close the connection so leftover body bytes
+            # can never be parsed as a pipelined follow-up request.
+            self.close_connection = True
             if isinstance(exc, RequestError):
                 self._send_json(exc.status, {"error": exc.message})
                 return
@@ -1106,6 +1117,28 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
 class TunnelHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # Slowloris-style trickle keeps each connection (and its thread) alive
+    # indefinitely via the idle-resetting socket timeout. Cap concurrent
+    # threads so a passive connection flood cannot exhaust the process.
+    max_threads = 64
+    _thread_count = 0
+    _thread_count_lock = threading.Lock()
+
+    def process_request(self, request, client_address):
+        with self._thread_count_lock:
+            if self._thread_count >= self.max_threads:
+                try:
+                    request.shutdown(socket.SHUT_RDWR)
+                    request.close()
+                except OSError:
+                    pass
+                return
+            self._thread_count += 1
+        try:
+            super().process_request(request, client_address)
+        finally:
+            with self._thread_count_lock:
+                self._thread_count -= 1
 
 
 def main() -> None:
