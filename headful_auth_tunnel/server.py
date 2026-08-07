@@ -789,7 +789,10 @@ class SessionStore:
 
 def make_handler(config: Config, controller: BrowserController, sessions: SessionStore):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "HeadfulAuthTunnel/0.4.0"
+        server_version = "HeadfulAuthTunnel"
+        # No version numbers in the banner (app or Python): they leak exact
+        # build info to unauthenticated clients on every 200/303/401/501.
+        sys_version = ""
 
         def setup(self) -> None:
             super().setup()
@@ -835,7 +838,10 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             self.send_response(status)
             self._headers(content_type, len(payload), extra)
             self.end_headers()
-            self.wfile.write(payload)
+            # HEAD must not emit a body (RFC 9110 §9.3.2); Content-Length
+            # still advertises what GET would return.
+            if self.command != "HEAD":
+                self.wfile.write(payload)
 
         def _send_text(
             self,
@@ -923,6 +929,33 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                 return
             LOGGER.exception("Request failed")
             self._send_json(500, {"error": "Internal server error"})
+
+        def do_HEAD(self) -> None:
+            # RFC 9110 §9.3.2: servers MUST support HEAD wherever GET is
+            # supported, and it must be identical to GET minus the body.
+            try:
+                self._do_GET()
+            except BaseException as exc:
+                self._handle_error(exc)
+
+        def do_OPTIONS(self) -> None:
+            try:
+                self.send_response(204)
+                self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except BaseException as exc:
+                self._handle_error(exc)
+
+        def do_TRACE(self) -> None:
+            # TRACE is disabled (XST hardening; no Allow listing).
+            try:
+                self.send_response(405)
+                self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            except BaseException as exc:
+                self._handle_error(exc)
 
         def do_GET(self) -> None:
             try:
