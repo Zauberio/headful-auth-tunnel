@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import queue
 import secrets
 import ssl
@@ -788,6 +789,8 @@ class SessionStore:
 
 
 def make_handler(config: Config, controller: BrowserController, sessions: SessionStore):
+    readiness_nonce = os.environ.get("HEADFUL_READINESS_NONCE") or None
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "HeadfulAuthTunnel/0.4.0"
 
@@ -941,6 +944,8 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                     health = {"status": "degraded", "browser": False}
                 if not config.expose_health_details:
                     health = {"status": health["status"]}
+                if readiness_nonce:
+                    health["nonce"] = readiness_nonce
                 self._send_json(200 if health["status"] == "ok" else 503, health)
                 return
 
