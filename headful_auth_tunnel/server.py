@@ -930,6 +930,46 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             LOGGER.exception("Request failed")
             self._send_json(500, {"error": "Internal server error"})
 
+        def _allowed_methods(self, path: str) -> str | None:
+            get_paths = {
+                "/",
+                "/app.css",
+                "/app.js",
+                "/health",
+                "/meta",
+                "/page",
+                "/screenshot",
+                "/tabs",
+            }
+            post_paths = {
+                "/click",
+                "/dom/click",
+                "/dom/fill",
+                "/dom/press",
+                "/dom/select",
+                "/drag",
+                "/history/back",
+                "/history/forward",
+                "/key",
+                "/logout",
+                "/navigate",
+                "/page",
+                "/reload",
+                "/session",
+                "/tabs/close",
+                "/tabs/focus",
+                "/type",
+                "/viewport",
+            }
+            methods: list[str] = []
+            if path in get_paths:
+                methods.extend(["GET", "HEAD"])
+            if path in post_paths:
+                methods.append("POST")
+            if not methods:
+                return None
+            return ", ".join(methods)
+
         def do_HEAD(self) -> None:
             # RFC 9110 §9.3.2: servers MUST support HEAD wherever GET is
             # supported, and it must be identical to GET minus the body.
@@ -940,20 +980,22 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
 
         def do_OPTIONS(self) -> None:
             try:
-                self.send_response(204)
-                self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                allow = self._allowed_methods(urlsplit(self.path).path)
+                if allow is None:
+                    self._send_json(404, {"error": "Not found"})
+                    return
+                self._send_bytes(204, b"", "text/plain; charset=utf-8", {"Allow": allow})
             except BaseException as exc:
                 self._handle_error(exc)
 
         def do_TRACE(self) -> None:
-            # TRACE is disabled (XST hardening; no Allow listing).
+            # TRACE is disabled (XST hardening; TRACE is never listed in Allow).
             try:
-                self.send_response(405)
-                self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
-                self.send_header("Content-Length", "0")
-                self.end_headers()
+                allow = self._allowed_methods(urlsplit(self.path).path)
+                if allow is None:
+                    self._send_json(404, {"error": "Not found"})
+                    return
+                self._send_bytes(405, b"", "text/plain; charset=utf-8", {"Allow": allow})
             except BaseException as exc:
                 self._handle_error(exc)
 

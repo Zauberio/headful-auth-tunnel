@@ -5,6 +5,7 @@ import json
 import threading
 import time
 import types
+from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
@@ -733,3 +734,103 @@ def test_browser_action_click_revalidates_final_url(make_config):
 
     assert exc.value.status == 403
     assert fake_page.goto_calls == ["about:blank"]
+
+
+def _session_cookie(server, config):
+    encoded = urlencode({"token": config.auth_token})
+    status, headers, _ = request(
+        server,
+        "POST",
+        "/session",
+        encoded,
+        {"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert status == 303
+    return headers["Set-Cookie"].split(";", 1)[0]
+
+
+def test_options_get_resource_has_security_headers_and_allow(make_config):
+    config = make_config()
+    server, thread = start_server(config)
+    try:
+        cookie_pair = _session_cookie(server, config)
+        status, headers, _ = request(
+            server,
+            "OPTIONS",
+            "/meta",
+            headers={"Cookie": cookie_pair},
+        )
+        assert status == 204
+        assert headers["X-Content-Type-Options"] == "nosniff"
+        assert "Content-Security-Policy" in headers
+        assert headers["Cache-Control"].startswith("no-store")
+        assert headers["Allow"] == "GET, HEAD"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_options_post_resource_allow(make_config):
+    config = make_config()
+    server, thread = start_server(config)
+    try:
+        status, headers, _ = request(server, "OPTIONS", "/session")
+        assert status == 204
+        assert headers["Allow"] == "POST"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_options_unknown_path_is_404(make_config):
+    config = make_config()
+    server, thread = start_server(config)
+    try:
+        status, _, payload = request(server, "OPTIONS", "/no-such-route")
+        assert status == 404
+        assert json.loads(payload)["error"] == "Not found"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_trace_get_resource_is_405_with_security_headers(make_config):
+    config = make_config()
+    server, thread = start_server(config)
+    try:
+        cookie_pair = _session_cookie(server, config)
+        status, headers, _ = request(
+            server,
+            "TRACE",
+            "/meta",
+            headers={"Cookie": cookie_pair},
+        )
+        assert status == 405
+        assert headers["X-Content-Type-Options"] == "nosniff"
+        assert "Content-Security-Policy" in headers
+        assert headers["Cache-Control"].startswith("no-store")
+        assert headers["Allow"] == "GET, HEAD"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_options_includes_hsts_when_tls_configured(make_config):
+    # tls_enabled is a Path-presence check; dummy paths flip HSTS without
+    # wrapping the test server in TLS or adding cert-file fixtures.
+    config = make_config(tls_cert=Path("dummy.crt"), tls_key=Path("dummy.key"))
+    server, thread = start_server(config)
+    try:
+        status, headers, _ = request(server, "OPTIONS", "/health")
+        assert status == 204
+        assert headers["Strict-Transport-Security"] == "max-age=31536000"
+        assert headers["X-Content-Type-Options"] == "nosniff"
+        assert headers["Allow"] == "GET, HEAD"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
