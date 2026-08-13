@@ -733,3 +733,57 @@ def test_browser_action_click_revalidates_final_url(make_config):
 
     assert exc.value.status == 403
     assert fake_page.goto_calls == ["about:blank"]
+
+
+def test_thread_cap_rejects_excess_trickled_connections(make_config):
+    config = make_config()
+    server, thread = start_server(config)
+    trickles = []
+    excess = None
+
+    def wait_for_count(expected):
+        deadline = time.monotonic() + 5
+        while server._thread_count != expected:
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"thread count stayed at {server._thread_count}, expected {expected}"
+                )
+            time.sleep(0.01)
+
+    try:
+        for _ in range(server.max_threads):
+            sock = socket.create_connection(("127.0.0.1", server.server_port))
+            sock.sendall(b"GE")
+            trickles.append(sock)
+
+        wait_for_count(server.max_threads)
+
+        excess = socket.create_connection(("127.0.0.1", server.server_port))
+        try:
+            excess.sendall(b"GE")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        else:
+            time.sleep(0.1)
+            excess.settimeout(1)
+            try:
+                assert excess.recv(16) == b""
+            except ConnectionResetError:
+                pass
+
+        for sock in trickles:
+            sock.close()
+        trickles.clear()
+
+        wait_for_count(0)
+
+        status, _, _ = request(server, "GET", "/health")
+        assert status == 200
+    finally:
+        for sock in trickles:
+            sock.close()
+        if excess is not None:
+            excess.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

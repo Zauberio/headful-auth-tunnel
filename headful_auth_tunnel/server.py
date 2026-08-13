@@ -4,8 +4,8 @@ import contextlib
 import json
 import logging
 import queue
-import socket
 import secrets
+import socket
 import ssl
 import threading
 import time
@@ -1136,6 +1136,14 @@ class TunnelHTTPServer(ThreadingHTTPServer):
             self._thread_count += 1
         try:
             super().process_request(request, client_address)
+        except BaseException:
+            with self._thread_count_lock:
+                self._thread_count -= 1
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
         finally:
             with self._thread_count_lock:
                 self._thread_count -= 1
