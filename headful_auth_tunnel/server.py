@@ -764,7 +764,16 @@ class SessionStore:
             # Evict the least-recently-USED session, not the oldest-created:
             # a long-lived active session must not be killed by new logins.
             if len(self._sessions) >= 128:
-                lru = min(self._last_used, key=self._last_used.get)
+                # drop any orphan LRU entries so we never evict a stale key
+                for _tok in list(self._last_used):
+                    if _tok not in self._sessions:
+                        self._last_used.pop(_tok, None)
+                if not self._last_used:
+                    # fallback: no LRU data (should not happen) — evict oldest
+                    lru = min(self._sessions, key=self._sessions.get)
+                    self._sessions.pop(lru, None)
+                else:
+                    lru = min(self._last_used, key=self._last_used.get)
                 self._sessions.pop(lru, None)
                 self._last_used.pop(lru, None)
             self._sessions[token] = now + self.ttl_seconds
@@ -788,11 +797,17 @@ class SessionStore:
             return
         with self._lock:
             self._sessions.pop(token, None)
+            self._last_used.pop(token, None)
 
     def _purge(self, now: float) -> None:
         expired = [token for token, expires in self._sessions.items() if expires <= now]
         for token in expired:
             self._sessions.pop(token, None)
+            self._last_used.pop(token, None)
+        # purge stale LRU entries for already-expired/revoked sessions
+        for token in list(self._last_used):
+            if token not in self._sessions:
+                self._last_used.pop(token, None)
 
 
 def make_handler(config: Config, controller: BrowserController, sessions: SessionStore):
@@ -963,7 +978,7 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                     # one per hit: repeated ?token= logins otherwise multiply
                     # live 12h session cookies and the old ones are never
                     # revoked.
-                    existing = self._session_value()
+                    existing = self._cookie_value()
                     if existing and sessions.valid(existing):
                         self._redirect("/")
                         return
@@ -1024,7 +1039,7 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                 if not isinstance(supplied, str) or not compare_digest(supplied, config.auth_token):
                     self._send_json(401, {"error": "Invalid token"})
                     return
-                existing = self._session_value()
+                existing = self._cookie_value()
                 if existing and sessions.valid(existing):
                     self._redirect("/")
                     return
