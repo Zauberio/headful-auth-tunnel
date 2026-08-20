@@ -57,6 +57,10 @@ Returns:
 
 With `EXPOSE_HEALTH_DETAILS=true`, browser and tab counts are included.
 
+When `HEADFUL_READINESS_NONCE` is set (used internally by `scripts/start.sh` to bind the readiness probe to the spawned tunnel), the response also includes a `nonce` field echoing that per-start marker. The `nonce` is a startup-readiness marker, not an authentication token.
+
+> **Deployment:** `scripts/start.sh` and the installed `headful-auth-tunnel` package must be upgraded together — a stale `.venv` entrypoint without nonce support will fail the new readiness check until the package is reinstalled.
+
 ### `GET /meta`
 
 Returns the active URL/title, viewport, locale, timezone, browser mode, persistent-profile flag and browser instance identifier.

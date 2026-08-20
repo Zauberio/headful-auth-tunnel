@@ -86,7 +86,16 @@ while [ "$i" -lt 60 ]; do
     break
   fi
   if command -v curl >/dev/null 2>&1; then
-    health=$(curl -kfsS --max-time 2 "$scheme://127.0.0.1:$PORT/health" 2>/dev/null || true)
+    # TLS: loopback uses a self-signed certificate; with a trusted CA
+    # bundle available (TLS_CA_FILE), validate via --cacert, otherwise -k is
+    # intentional for the local self-signed cert. The handshake still
+    # requires the per-start nonce, so -k does not reintroduce the squatter
+    # false-success.
+    if [ "$scheme" = https ] && [ -n "${TLS_CA_FILE:-}" ] && [ -f "$TLS_CA_FILE" ]; then
+      health=$(curl -fsS --max-time 2 --cacert "$TLS_CA_FILE" "$scheme://127.0.0.1:$PORT/health" 2>/dev/null || true)
+    else
+      health=$(curl -kfsS --max-time 2 "$scheme://127.0.0.1:$PORT/health" 2>/dev/null || true)
+    fi
     # Verify BOTH that our pid is still alive AND the responder is the
     # tunnel we spawned (health JSON echoes the per-start nonce). A foreign
     # process squatting on the port can return {"status":"ok"} too - without
