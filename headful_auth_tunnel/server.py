@@ -468,10 +468,43 @@ class BrowserController:
             try:
                 result = getattr(session, command.method)(**command.kwargs)
             except BaseException as exc:
-                command.future.set_exception(exc)
+                if isinstance(exc, RequestError):
+                    command.future.set_exception(exc)
+                    continue
+                # Single recovery boundary: a non-client error usually means
+                # the browser session died. Restart it once and retry the
+                # exact command before surfacing the failure. Handlers never
+                # retry, so each failure is recovered at most once.
+                LOGGER.warning(
+                    "Browser command %r failed (%s); restarting session once",
+                    command.method,
+                    exc,
+                )
+                restarted = self._restart_session(session)
+                if restarted is None:
+                    command.future.set_exception(exc)
+                    continue
+                session = restarted
+                try:
+                    result = getattr(session, command.method)(**command.kwargs)
+                except BaseException as exc2:
+                    command.future.set_exception(exc2)
+                else:
+                    command.future.set_result(result)
             else:
                 command.future.set_result(result)
         session.close()
+
+    def _restart_session(self, session: BrowserSession) -> BrowserSession | None:
+        session.close()
+        replacement = BrowserSession(self.config)
+        try:
+            replacement.start()
+        except BaseException as exc:
+            LOGGER.error("Browser session restart failed: %s", exc)
+            replacement.close()
+            return None
+        return replacement
 
     def call(self, method: str, timeout: float = 65, **kwargs):
         future: Future = Future()
@@ -847,6 +880,34 @@ class TunnelHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(
+        self,
+        server_address,
+        RequestHandlerClass,
+        bind_and_activate=True,
+        max_concurrent_requests: int = 16,
+    ):
+        super().__init__(server_address, RequestHandlerClass, bind_and_activate)
+        self._request_slots = threading.BoundedSemaphore(max(1, int(max_concurrent_requests)))
+
+    def process_request(self, request, client_address):
+        # Cap concurrent connections so a slowloris or unauth trickle cannot
+        # spawn unbounded threads: once saturated, refuse new connections.
+        if not self._request_slots.acquire(blocking=False):
+            self.close_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
 
 def main() -> None:
     logging.basicConfig(
@@ -864,6 +925,7 @@ def main() -> None:
     server = TunnelHTTPServer(
         (config.bind_host, config.port),
         make_handler(config, controller, sessions),
+        max_concurrent_requests=config.max_concurrent_connections,
     )
 
     if config.tls_enabled:
