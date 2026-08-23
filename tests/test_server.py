@@ -4,11 +4,15 @@ import http.client
 import json
 import threading
 import time
+import types
 from urllib.parse import urlencode
+
+import pytest
 
 from headful_auth_tunnel.security import NavigationDecision
 from headful_auth_tunnel.server import (
     BrowserSession,
+    RequestError,
     SessionStore,
     TunnelHTTPServer,
     make_handler,
@@ -172,9 +176,15 @@ class SnapshotPage:
     def __init__(self):
         self.closed = False
         self.arguments = None
+        self.url = "https://example.com"
+        self.goto_calls = []
 
     def is_closed(self):
         return self.closed
+
+    def goto(self, url, **kwargs):
+        self.goto_calls.append(url)
+        self.url = url
 
     def evaluate(self, script, arguments):
         self.arguments = arguments
@@ -187,7 +197,9 @@ class SnapshotContext:
 
 
 def test_snapshot_can_explicitly_include_sensitive_values(make_config):
-    session = BrowserSession(make_config())
+    # _check_final_url re-validates the landed URL; allow example.com
+    # explicitly so the guard short-circuits without DNS (netless sandboxes).
+    session = BrowserSession(make_config(allowed_hosts=("example.com",)))
     page = SnapshotPage()
     session.context = SnapshotContext(page)
     session.page = page
@@ -342,3 +354,74 @@ def test_current_page_uses_normalized_recovery_url(make_config):
     recovered = session._current_page()
 
     assert recovered.goto_calls[0]["url"] == "https://example.com/"
+
+
+class FakePage:
+    def __init__(self, url="", *, navigate_on_click=None):
+        self.url = url
+        self.goto_calls = []
+        self.navigate_on_click = navigate_on_click
+        self.mouse = types.SimpleNamespace(click=self._click)
+        self.closed = False
+
+    def is_closed(self):
+        return self.closed
+
+    def goto(self, url, **kwargs):
+        self.goto_calls.append(url)
+        self.url = url
+
+    def _click(self, x, y):
+        if self.navigate_on_click is not None:
+            self.url = self.navigate_on_click
+
+
+def test_final_url_check_refreshes_policy_every_landing(make_config):
+    session = BrowserSession(make_config())
+    recorded = []
+
+    class RecordingPolicy:
+        def validate(self, url, *, allow_non_network=False, refresh=False):
+            recorded.append(
+                {
+                    "url": url,
+                    "allow_non_network": allow_non_network,
+                    "refresh": refresh,
+                }
+            )
+            return NavigationDecision(True, "ok", url)
+
+    session.policy = RecordingPolicy()
+    fake_page = types.SimpleNamespace(url="https://ok.test/")
+
+    result = session._check_final_url(fake_page)
+
+    assert recorded[0]["refresh"] is True
+    assert result == "https://ok.test/"
+
+
+def test_final_url_check_quarantines_blocked_page(make_config):
+    session = BrowserSession(make_config(denied_hosts=("blocked.test",)))
+    fake_page = FakePage(url="https://blocked.test/x")
+
+    with pytest.raises(RequestError) as exc:
+        session._check_final_url(fake_page)
+
+    assert exc.value.status == 403
+    assert fake_page.goto_calls == ["about:blank"]
+
+
+def test_browser_action_click_revalidates_final_url(make_config):
+    session = BrowserSession(make_config(denied_hosts=("blocked.test",)))
+    fake_page = FakePage(
+        url="https://ok.test/",
+        navigate_on_click="https://blocked.test/landed",
+    )
+    session.context = types.SimpleNamespace(pages=[fake_page])
+    session.page = fake_page
+
+    with pytest.raises(RequestError) as exc:
+        session.click(100, 100)
+
+    assert exc.value.status == 403
+    assert fake_page.goto_calls == ["about:blank"]
