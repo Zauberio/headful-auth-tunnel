@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from headful_auth_tunnel.config import Config
+from headful_auth_tunnel import config as config_mod
+from headful_auth_tunnel.config import Config, load_or_create_token
 
 RELEVANT_ENV = {
     "AUTH_TOKEN",
@@ -79,3 +81,85 @@ def test_partial_tls_configuration_is_rejected(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="configured together"):
         Config.from_env()
+
+
+def test_existing_complete_token_is_adopted(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    token_file = tmp_path / "token"
+    winner = "W" * 32
+    token_file.write_text(winner + "\n", encoding="utf-8")
+    monkeypatch.setenv("TOKEN_FILE", str(token_file))
+
+    token, path = load_or_create_token()
+
+    assert token == winner
+    assert path == token_file
+    assert token_file.read_text(encoding="utf-8").strip() == winner
+
+
+def test_short_existing_token_fails_closed(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    token_file = tmp_path / "token"
+    token_file.write_text("too-short\n", encoding="utf-8")
+    monkeypatch.setenv("TOKEN_FILE", str(token_file))
+    monkeypatch.setattr(config_mod, "_TOKEN_HANDOFF_ATTEMPTS", 3)
+    monkeypatch.setattr(config_mod, "_TOKEN_HANDOFF_INTERVAL_S", 0)
+
+    with pytest.raises(ValueError, match="at least 24 characters"):
+        load_or_create_token()
+
+    assert token_file.read_text(encoding="utf-8").strip() == "too-short"
+
+
+def test_empty_token_file_retries_until_winner_writes(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    token_file = tmp_path / "token"
+    token_file.write_text("", encoding="utf-8")
+    winner = "H" * 32
+    monkeypatch.setenv("TOKEN_FILE", str(token_file))
+
+    def write_on_second_sleep(_seconds):
+        write_on_second_sleep.calls += 1
+        if write_on_second_sleep.calls == 2:
+            token_file.write_text(winner + "\n", encoding="utf-8")
+
+    write_on_second_sleep.calls = 0
+    monkeypatch.setattr(config_mod.time, "sleep", write_on_second_sleep)
+
+    token, path = load_or_create_token()
+
+    assert token == winner
+    assert path == token_file
+    assert token_file.read_text(encoding="utf-8").strip() == winner
+
+
+def test_empty_token_file_fails_closed_without_minted_fallback(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    token_file = tmp_path / "token"
+    token_file.write_text("", encoding="utf-8")
+    monkeypatch.setenv("TOKEN_FILE", str(token_file))
+    minted = "M" * 32
+    monkeypatch.setattr(config_mod.secrets, "token_urlsafe", lambda _n: minted)
+    monkeypatch.setattr(config_mod, "_TOKEN_HANDOFF_ATTEMPTS", 3)
+    monkeypatch.setattr(config_mod, "_TOKEN_HANDOFF_INTERVAL_S", 0)
+
+    with pytest.raises(ValueError, match="at least 24 characters"):
+        load_or_create_token()
+
+    assert token_file.read_text(encoding="utf-8").strip() == ""
+
+
+def test_concurrent_first_starts_share_persisted_token(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    token_file = tmp_path / "token"
+    profile_dir = tmp_path / "profile"
+    monkeypatch.setenv("TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("PROFILE_DIR", str(profile_dir))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        configs = list(pool.map(lambda _: Config.from_env(), range(8)))
+
+    persisted = token_file.read_text(encoding="utf-8").strip()
+    assert len(persisted) >= 24
+    assert {cfg.auth_token for cfg in configs} == {persisted}
+    assert all(cfg.token_file == token_file for cfg in configs)

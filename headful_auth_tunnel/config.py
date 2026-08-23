@@ -3,9 +3,14 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+
+_TOKEN_MIN_LENGTH = 24
+_TOKEN_HANDOFF_ATTEMPTS = 100
+_TOKEN_HANDOFF_INTERVAL_S = 0.005
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -44,11 +49,29 @@ def _default_token_file() -> Path:
     return state_home / "headful-auth-tunnel" / "token"
 
 
+def _adopt_persisted_token(token_file: Path) -> str:
+    """Read a complete persisted token, retrying mid-write; fail closed on timeout."""
+    last_error: OSError | None = None
+    for attempt in range(_TOKEN_HANDOFF_ATTEMPTS):
+        try:
+            token = token_file.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            last_error = exc
+        else:
+            if len(token) >= _TOKEN_MIN_LENGTH:
+                return token
+        if attempt + 1 < _TOKEN_HANDOFF_ATTEMPTS:
+            time.sleep(_TOKEN_HANDOFF_INTERVAL_S)
+    raise ValueError(
+        f"Token in {token_file} must contain at least {_TOKEN_MIN_LENGTH} characters"
+    ) from last_error
+
+
 def load_or_create_token() -> tuple[str, Path | None]:
     inline = os.getenv("AUTH_TOKEN")
     if inline:
         token = inline.strip()
-        if len(token) < 24:
+        if len(token) < _TOKEN_MIN_LENGTH:
             raise ValueError("AUTH_TOKEN must contain at least 24 characters")
         return token, None
 
@@ -57,16 +80,25 @@ def load_or_create_token() -> tuple[str, Path | None]:
     with suppress(OSError):
         token_file.parent.chmod(0o700)
 
-    if token_file.exists():
-        token = token_file.read_text(encoding="utf-8").strip()
-        if len(token) < 24:
-            raise ValueError(f"Token in {token_file} must contain at least 24 characters")
+    # Exclusive-create: two concurrent first starts would each mint their
+    # own token and last-writer-wins the file - the loser of the port-bind
+    # race exits after writing, and the surviving server authenticates the
+    # OTHER token (users reading the file get 401). On EEXIST, adopt the
+    # winner's token instead of overwriting. The creator makes the path
+    # visible before writing, so an empty or short read is retried until a
+    # complete token appears; timeout fails closed (never return a minted
+    # token that was not persisted).
+    token = secrets.token_urlsafe(32)
+    try:
+        with token_file.open("x", encoding="utf-8") as fh:
+            fh.write(token + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except FileExistsError:
+        token = _adopt_persisted_token(token_file)
         with suppress(OSError):
             token_file.chmod(0o600)
         return token, token_file
-
-    token = secrets.token_urlsafe(32)
-    token_file.write_text(token + "\n", encoding="utf-8")
     token_file.chmod(0o600)
     return token, token_file
 
