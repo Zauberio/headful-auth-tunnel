@@ -178,6 +178,7 @@ class SnapshotPage:
         self.arguments = None
         self.url = "https://example.com"
         self.goto_calls = []
+        self.frames = []
 
     def is_closed(self):
         return self.closed
@@ -235,6 +236,7 @@ class LifecyclePage:
         self.url = url
         self.viewport = None
         self.goto_calls = []
+        self.frames = []
 
     def is_closed(self):
         return self.closed
@@ -360,6 +362,7 @@ class FakePage:
     def __init__(self, url="", *, navigate_on_click=None):
         self.url = url
         self.goto_calls = []
+        self.frames = []
         self.navigate_on_click = navigate_on_click
         self.mouse = types.SimpleNamespace(click=self._click)
         self.closed = False
@@ -465,6 +468,44 @@ def test_frame_landing_forces_fresh_dns_every_time(make_config):
     assert refreshes == [True, True]
 
 
+def test_read_boundary_rejects_blocked_subframe(make_config):
+    session = BrowserSession(make_config())
+    page = FakePage(url="https://ok.test/")
+    page.frames = [_Frame(page, "https://blocked.test/frame")]
+
+    class Policy:
+        def validate(self, url, *, allow_non_network=False, refresh=False):
+            if "blocked.test" in url:
+                return NavigationDecision(False, "denied", url)
+            return NavigationDecision(True, "ok", url)
+
+    session.policy = Policy()
+    with pytest.raises(RequestError, match="Frame blocked"):
+        session._check_final_url(page)
+    assert page.goto_calls == ["about:blank"]
+
+
+def test_frame_dns_budget_fails_closed(make_config):
+    session = BrowserSession(make_config())
+    session._frame_dns_max_events = 2
+    page = FakePage(url="https://ok.test/")
+    frame = _Frame(page, "https://same.test/frame")
+    calls = []
+
+    class Policy:
+        def validate(self, url, *, allow_non_network=False, refresh=False):
+            calls.append((url, refresh))
+            return NavigationDecision(True, "ok", url)
+
+    session.policy = Policy()
+    session._on_frame_navigated(frame)
+    session._on_frame_navigated(frame)
+    session._on_frame_navigated(frame)
+
+    assert len(calls) == 2
+    assert page.goto_calls == ["about:blank"]
+
+
 def test_final_url_check_refreshes_policy_every_landing(make_config):
     session = BrowserSession(make_config())
     recorded = []
@@ -481,7 +522,7 @@ def test_final_url_check_refreshes_policy_every_landing(make_config):
             return NavigationDecision(True, "ok", url)
 
     session.policy = RecordingPolicy()
-    fake_page = types.SimpleNamespace(url="https://ok.test/")
+    fake_page = types.SimpleNamespace(url="https://ok.test/", frames=[])
 
     result = session._check_final_url(fake_page)
 

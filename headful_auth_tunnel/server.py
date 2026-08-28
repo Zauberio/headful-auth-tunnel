@@ -48,6 +48,11 @@ class BrowserSession:
         self.viewport = {"width": config.screen_width, "height": config.screen_height}
         self.instance_id = secrets.token_hex(8)
         self.started_at = time.time()
+        self._frame_dns_window_started = time.monotonic()
+        self._frame_dns_events = 0
+        self._frame_dns_window_seconds = 5.0
+        self._frame_dns_max_events = 32
+        self._read_frame_limit = 64
 
     def start(self) -> None:
         decision = self.policy.validate(self.config.base_url, refresh=True)
@@ -93,11 +98,6 @@ class BrowserSession:
                 p.on("framenavigated", self._on_frame_navigated)
             except Exception:
                 LOGGER.exception("Failed to attach frame navigation handler to existing page")
-        if self.page not in pages:
-            try:
-                self.page.on("framenavigated", self._on_frame_navigated)
-            except Exception:
-                LOGGER.exception("Failed to attach frame navigation handler to new page")
         self.page.set_viewport_size(self.viewport)
         self.page.goto(
             decision.normalized_url or self.config.base_url,
@@ -169,6 +169,16 @@ class BrowserSession:
         if self.page is None or self.page.is_closed() or self.page not in self._pages():
             self.page = page
 
+    def _consume_frame_dns_budget(self) -> bool:
+        now = time.monotonic()
+        if now - self._frame_dns_window_started >= self._frame_dns_window_seconds:
+            self._frame_dns_window_started = now
+            self._frame_dns_events = 0
+        if self._frame_dns_events >= self._frame_dns_max_events:
+            return False
+        self._frame_dns_events += 1
+        return True
+
     def _on_frame_navigated(self, frame) -> None:
         """Fail closed for browser-triggered main-frame and sub-frame landings."""
         try:
@@ -187,6 +197,14 @@ class BrowserSession:
                 page.goto("about:blank")
             except Exception:
                 LOGGER.exception("Failed to quarantine frame with unreadable URL")
+            return
+
+        if not self._consume_frame_dns_budget():
+            LOGGER.warning("Blocked frame navigation: DNS validation budget exceeded")
+            try:
+                page.goto("about:blank")
+            except Exception:
+                LOGGER.exception("Failed to quarantine page after DNS budget exhaustion")
             return
 
         try:
@@ -360,6 +378,45 @@ class BrowserSession:
             except Exception:
                 LOGGER.exception("Failed to quarantine blocked page")
             raise RequestError(403, f"Redirected to blocked host: {decision.reason}")
+
+        try:
+            frames = list(page.frames)
+        except Exception:
+            try:
+                page.goto("about:blank")
+            except Exception:
+                LOGGER.exception("Failed to quarantine page with unreadable frame inventory")
+            raise RequestError(403, "Blocked: could not inspect page frames") from None
+        if len(frames) > self._read_frame_limit:
+            try:
+                page.goto("about:blank")
+            except Exception:
+                LOGGER.exception("Failed to quarantine page with excessive frame count")
+            raise RequestError(403, "Blocked: page has too many frames")
+
+        for frame in frames:
+            try:
+                frame_url = frame.url or ""
+            except Exception:
+                frame_url = ""
+            if not frame_url:
+                try:
+                    page.goto("about:blank")
+                except Exception:
+                    LOGGER.exception("Failed to quarantine page with unreadable frame URL")
+                raise RequestError(403, "Blocked: could not determine frame URL")
+            frame_decision = self.policy.validate(
+                frame_url,
+                allow_non_network=True,
+                refresh=True,
+            )
+            if not frame_decision.allowed:
+                try:
+                    page.goto("about:blank")
+                except Exception:
+                    LOGGER.exception("Failed to quarantine page with blocked frame")
+                raise RequestError(403, f"Frame blocked: {frame_decision.reason}")
+
         return decision.normalized_url or url
 
     def navigate(self, url: str) -> dict[str, Any]:
