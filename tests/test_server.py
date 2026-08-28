@@ -376,6 +376,95 @@ class FakePage:
             self.url = self.navigate_on_click
 
 
+class _ClosableSession:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _UnreadableUrlPage(FakePage):
+    @property
+    def url(self):
+        raise RuntimeError("url unavailable")
+
+    @url.setter
+    def url(self, value):
+        self._url = value
+
+
+class _Frame:
+    def __init__(self, page, url):
+        self.page = page
+        self.url = url
+
+
+class _UnreadableFrame:
+    def __init__(self, page):
+        self.page = page
+
+    @property
+    def url(self):
+        raise RuntimeError("frame url unavailable")
+
+
+def test_startup_final_url_unreadable_fails_closed(make_config):
+    session = BrowserSession(make_config())
+    session.page = _UnreadableUrlPage()
+    session.session = _ClosableSession()
+
+    with pytest.raises(RuntimeError, match="could not be determined"):
+        session._check_startup_final_url()
+
+    assert session.session.closed is True
+
+
+def test_subframe_landing_is_validated_and_quarantined(make_config):
+    session = BrowserSession(make_config())
+    page = FakePage(url="https://ok.test/")
+    frame = _Frame(page, "https://blocked.test/frame")
+    calls = []
+
+    class Policy:
+        def validate(self, url, *, allow_non_network=False, refresh=False):
+            calls.append((url, allow_non_network, refresh))
+            return NavigationDecision(False, "denied", url)
+
+    session.policy = Policy()
+    session._on_frame_navigated(frame)
+
+    assert calls == [("https://blocked.test/frame", True, True)]
+    assert page.goto_calls == ["about:blank"]
+
+
+def test_unreadable_frame_url_is_quarantined(make_config):
+    session = BrowserSession(make_config())
+    page = FakePage(url="https://ok.test/")
+
+    session._on_frame_navigated(_UnreadableFrame(page))
+
+    assert page.goto_calls == ["about:blank"]
+
+
+def test_frame_landing_forces_fresh_dns_every_time(make_config):
+    session = BrowserSession(make_config())
+    page = FakePage(url="https://ok.test/")
+    frame = _Frame(page, "https://same.test/frame")
+    refreshes = []
+
+    class Policy:
+        def validate(self, url, *, allow_non_network=False, refresh=False):
+            refreshes.append(refresh)
+            return NavigationDecision(True, "ok", url)
+
+    session.policy = Policy()
+    session._on_frame_navigated(frame)
+    session._on_frame_navigated(frame)
+
+    assert refreshes == [True, True]
+
+
 def test_final_url_check_refreshes_policy_every_landing(make_config):
     session = BrowserSession(make_config())
     recorded = []

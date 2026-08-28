@@ -48,11 +48,6 @@ class BrowserSession:
         self.viewport = {"width": config.screen_width, "height": config.screen_height}
         self.instance_id = secrets.token_hex(8)
         self.started_at = time.time()
-        # Per-host throttle for forced-DNS revalidation on frame navigations.
-        # A hostile page navigating rapidly between subdomains of the same
-        # host could otherwise spin the resolver with refresh=True lookups.
-        self._frame_dns_check_at: dict[str, float] = {}
-        self._frame_dns_min_interval = 5.0  # seconds between forced refreshes per host
 
     def start(self) -> None:
         decision = self.policy.validate(self.config.base_url, refresh=True)
@@ -111,16 +106,18 @@ class BrowserSession:
         )
         # A 302 from BASE_URL to a denied host is followed internally by
         # Chromium (never routed) - re-validate where we actually landed.
-        final_url = ""
-        try:
-            final_url = self.page.url or ""
-        except Exception:
-            pass
-        if final_url:
-            final_decision = self.policy.validate(final_url, refresh=True)
-            if not final_decision.allowed:
-                self.session.close()
-                raise RuntimeError(f"BASE_URL redirected to blocked host: {final_decision.reason}")
+        self._check_startup_final_url()
+
+    def _check_startup_final_url(self) -> str:
+        final_url = self._final_url(self.page)
+        if not final_url:
+            self.session.close()
+            raise RuntimeError("BASE_URL final URL could not be determined")
+        decision = self.policy.validate(final_url, refresh=True)
+        if not decision.allowed:
+            self.session.close()
+            raise RuntimeError(f"BASE_URL redirected to blocked host: {decision.reason}")
+        return decision.normalized_url or final_url
 
     def close(self) -> None:
         if self.session is not None:
@@ -173,59 +170,47 @@ class BrowserSession:
             self.page = page
 
     def _on_frame_navigated(self, frame) -> None:
-        """Best-effort revalidation for navigations not via control API."""
+        """Fail closed for browser-triggered main-frame and sub-frame landings."""
         try:
-            # Only main-frame navigations change the document URL exposed via
-            # /page and /screenshot; sub-frames are already filtered by route.
-            try:
-                is_main = frame.is_main_frame() if callable(getattr(frame, "is_main_frame", None)) else getattr(frame, "is_main_frame", True)
-            except Exception:
-                is_main = True
-            if not is_main:
-                return
+            page = frame.page if hasattr(frame, "page") and frame.page else self._current_page()
+        except Exception:
+            page = self._current_page()
+
+        try:
+            url = frame.url or ""
+        except Exception:
             url = ""
+
+        if not url:
+            LOGGER.warning("Blocked frame navigation: final URL could not be determined")
             try:
-                url = frame.url or ""
+                page.goto("about:blank")
             except Exception:
-                # Fallback to page url if frame.url unavailable
-                try:
-                    url = frame.page.url if hasattr(frame, "page") and frame.page else ""
-                except Exception:
-                    url = ""
-            if not url:
-                return
-            # Force fresh DNS for the final landing, but throttle per host so a
-            # hostile page cycling navigations cannot spin the resolver. The
-            # first navigation to a host always revalidates with fresh DNS;
-            # rapid repeats within the window reuse the policy cache (the URL
-            # itself is still fully validated on every navigation).
-            try:
-                host = (urlsplit(url).hostname or "").lower()
-            except Exception:
-                host = ""
-            now = time.time()
-            last_check = self._frame_dns_check_at.get(host, 0.0) if host else float("inf")
-            force_refresh = (now - last_check) >= self._frame_dns_min_interval
-            if host and force_refresh:
-                self._frame_dns_check_at[host] = now
-                if len(self._frame_dns_check_at) > 256:
-                    # Bound memory: drop the oldest entries.
-                    for k in sorted(self._frame_dns_check_at, key=lambda k: self._frame_dns_check_at[k])[:128]:
-                        self._frame_dns_check_at.pop(k, None)
-            decision = self.policy.validate(url, allow_non_network=True, refresh=force_refresh)
-            if not decision.allowed:
-                LOGGER.warning("Blocked frame navigation to %s: %s", url, decision.reason)
-                try:
-                    # Prefer quarantining via the frame's page
-                    target = frame.page if hasattr(frame, "page") and frame.page else self._current_page()
-                    target.goto("about:blank")
-                except Exception:
-                    try:
-                        self._current_page().goto("about:blank")
-                    except Exception:
-                        LOGGER.exception("Failed to quarantine frame-blocked page")
+                LOGGER.exception("Failed to quarantine frame with unreadable URL")
+            return
+
+        try:
+            decision = self.policy.validate(
+                url,
+                allow_non_network=True,
+                refresh=True,
+            )
         except Exception:
             LOGGER.exception("Frame navigation validation failed")
+            try:
+                page.goto("about:blank")
+            except Exception:
+                LOGGER.exception("Failed to quarantine frame after validation error")
+            return
+
+        if decision.allowed:
+            return
+
+        LOGGER.warning("Blocked frame navigation to %s: %s", url, decision.reason)
+        try:
+            page.goto("about:blank")
+        except Exception:
+            LOGGER.exception("Failed to quarantine frame-blocked page")
 
     def _pages(self) -> list[Any]:
         if self.context is None:
@@ -392,25 +377,19 @@ class BrowserSession:
 
     def reload(self) -> dict[str, Any]:
         page = self._current_page()
-        page.reload(
-            wait_until="domcontentloaded", timeout=self.config.navigation_timeout_ms
-        )
+        page.reload(wait_until="domcontentloaded", timeout=self.config.navigation_timeout_ms)
         self._check_final_url(page)
         return self.meta()
 
     def history_back(self) -> dict[str, Any]:
         page = self._current_page()
-        page.go_back(
-            wait_until="domcontentloaded", timeout=self.config.navigation_timeout_ms
-        )
+        page.go_back(wait_until="domcontentloaded", timeout=self.config.navigation_timeout_ms)
         self._check_final_url(page)
         return self.meta()
 
     def history_forward(self) -> dict[str, Any]:
         page = self._current_page()
-        page.go_forward(
-            wait_until="domcontentloaded", timeout=self.config.navigation_timeout_ms
-        )
+        page.go_forward(wait_until="domcontentloaded", timeout=self.config.navigation_timeout_ms)
         self._check_final_url(page)
         return self.meta()
 
