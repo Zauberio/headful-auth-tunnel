@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from hmac import compare_digest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from scrapling.fetchers import StealthySession
 
@@ -129,11 +129,41 @@ class BrowserSession:
 
     def _route_request(self, route, request) -> None:
         decision = self.policy.validate(request.url, allow_non_network=True)
-        if decision.allowed:
-            route.continue_()
-        else:
+        if not decision.allowed:
             LOGGER.warning("Blocked browser request to %s: %s", request.url, decision.reason)
             route.abort("blockedbyclient")
+            return
+
+        try:
+            is_navigation = request.is_navigation_request()
+        except Exception:
+            is_navigation = False
+        if not is_navigation:
+            route.continue_()
+            return
+
+        try:
+            response = route.fetch(max_redirects=0)
+        except Exception:
+            LOGGER.exception("Failed to inspect browser navigation response")
+            route.abort("failed")
+            return
+
+        if response.status in {301, 302, 303, 307, 308}:
+            location = response.headers.get("location", "")
+            if location:
+                target = urljoin(request.url, location)
+                redirect_decision = self.policy.validate(target, refresh=True)
+                if not redirect_decision.allowed:
+                    LOGGER.warning(
+                        "Blocked browser redirect to %s: %s",
+                        target,
+                        redirect_decision.reason,
+                    )
+                    route.abort("blockedbyclient")
+                    return
+
+        route.fulfill(response=response)
 
     def _route_websocket(self, websocket_route) -> None:
         decision = self.policy.validate_websocket(websocket_route.url)

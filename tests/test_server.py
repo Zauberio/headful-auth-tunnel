@@ -412,6 +412,81 @@ class _UnreadableFrame:
         raise RuntimeError("frame url unavailable")
 
 
+class _RouteResponse:
+    def __init__(self, status, headers=None):
+        self.status = status
+        self.headers = headers or {}
+
+
+class _RouteRequest:
+    def __init__(self, url, navigation=True):
+        self.url = url
+        self._navigation = navigation
+
+    def is_navigation_request(self):
+        return self._navigation
+
+
+class _Route:
+    def __init__(self, response=None):
+        self.response = response
+        self.fetch_kwargs = []
+        self.aborts = []
+        self.fulfilled = []
+        self.continued = 0
+
+    def fetch(self, **kwargs):
+        self.fetch_kwargs.append(kwargs)
+        return self.response
+
+    def abort(self, reason):
+        self.aborts.append(reason)
+
+    def fulfill(self, **kwargs):
+        self.fulfilled.append(kwargs)
+
+    def continue_(self):
+        self.continued += 1
+
+
+def test_navigation_route_blocks_denied_redirect_before_browser_follows(make_config):
+    session = BrowserSession(
+        make_config(allow_private_network_navigation=True, denied_hosts=("localhost",))
+    )
+    route = _Route(_RouteResponse(302, {"location": "http://localhost:9999/blocked"}))
+    request = _RouteRequest("http://127.0.0.1:9999/start")
+
+    session._route_request(route, request)
+
+    assert route.fetch_kwargs == [{"max_redirects": 0}]
+    assert route.aborts == ["blockedbyclient"]
+    assert route.fulfilled == []
+
+
+def test_navigation_route_fulfills_allowed_response(make_config):
+    session = BrowserSession(make_config(allow_private_network_navigation=True))
+    response = _RouteResponse(200, {})
+    route = _Route(response)
+    request = _RouteRequest("http://127.0.0.1:9999/start")
+
+    session._route_request(route, request)
+
+    assert route.fetch_kwargs == [{"max_redirects": 0}]
+    assert route.aborts == []
+    assert route.fulfilled == [{"response": response}]
+
+
+def test_non_navigation_route_keeps_continue_behavior(make_config):
+    session = BrowserSession(make_config(allow_private_network_navigation=True))
+    route = _Route()
+    request = _RouteRequest("http://127.0.0.1:9999/app.js", navigation=False)
+
+    session._route_request(route, request)
+
+    assert route.continued == 1
+    assert route.fetch_kwargs == []
+
+
 def test_startup_final_url_unreadable_fails_closed(make_config):
     session = BrowserSession(make_config())
     session.page = _UnreadableUrlPage()
