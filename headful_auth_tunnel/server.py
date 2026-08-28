@@ -53,6 +53,7 @@ class BrowserSession:
         self._frame_dns_window_seconds = 5.0
         self._frame_dns_max_events = 32
         self._read_frame_limit = 64
+        self._quarantining_pages: set[int] = set()
 
     def start(self) -> None:
         decision = self.policy.validate(self.config.base_url, refresh=True)
@@ -179,12 +180,34 @@ class BrowserSession:
         self._frame_dns_events += 1
         return True
 
+    def _quarantine_page(self, page, log_message: str) -> None:
+        key = id(page)
+        if key in self._quarantining_pages:
+            return
+        self._quarantining_pages.add(key)
+        try:
+            page.goto("about:blank")
+        except Exception:
+            LOGGER.exception(log_message)
+        finally:
+            self._quarantining_pages.discard(key)
+
+    def _consume_dns_or_block(self, page, reason: str) -> None:
+        if self._consume_frame_dns_budget():
+            return
+        LOGGER.warning("Blocked browser access: DNS validation budget exceeded")
+        self._quarantine_page(page, "Failed to quarantine page after DNS budget exhaustion")
+        raise RequestError(403, reason)
+
     def _on_frame_navigated(self, frame) -> None:
         """Fail closed for browser-triggered main-frame and sub-frame landings."""
         try:
             page = frame.page if hasattr(frame, "page") and frame.page else self._current_page()
         except Exception:
             page = self._current_page()
+
+        if id(page) in self._quarantining_pages:
+            return
 
         try:
             url = frame.url or ""
@@ -193,18 +216,15 @@ class BrowserSession:
 
         if not url:
             LOGGER.warning("Blocked frame navigation: final URL could not be determined")
-            try:
-                page.goto("about:blank")
-            except Exception:
-                LOGGER.exception("Failed to quarantine frame with unreadable URL")
+            self._quarantine_page(page, "Failed to quarantine frame with unreadable URL")
             return
 
         if not self._consume_frame_dns_budget():
             LOGGER.warning("Blocked frame navigation: DNS validation budget exceeded")
-            try:
-                page.goto("about:blank")
-            except Exception:
-                LOGGER.exception("Failed to quarantine page after DNS budget exhaustion")
+            self._quarantine_page(
+                page,
+                "Failed to quarantine page after DNS budget exhaustion",
+            )
             return
 
         try:
@@ -215,20 +235,14 @@ class BrowserSession:
             )
         except Exception:
             LOGGER.exception("Frame navigation validation failed")
-            try:
-                page.goto("about:blank")
-            except Exception:
-                LOGGER.exception("Failed to quarantine frame after validation error")
+            self._quarantine_page(page, "Failed to quarantine frame after validation error")
             return
 
         if decision.allowed:
             return
 
         LOGGER.warning("Blocked frame navigation to %s: %s", url, decision.reason)
-        try:
-            page.goto("about:blank")
-        except Exception:
-            LOGGER.exception("Failed to quarantine frame-blocked page")
+        self._quarantine_page(page, "Failed to quarantine frame-blocked page")
 
     def _pages(self) -> list[Any]:
         if self.context is None:
@@ -366,32 +380,24 @@ class BrowserSession:
         """
         url = self._final_url(page)
         if not url:
-            try:
-                page.goto("about:blank")
-            except Exception:
-                LOGGER.exception("Failed to quarantine page with unreadable URL")
+            self._quarantine_page(page, "Failed to quarantine page with unreadable URL")
             raise RequestError(403, "Blocked: could not determine final URL")
+        self._consume_dns_or_block(page, "Blocked: DNS validation budget exceeded")
         decision = self.policy.validate(url, allow_non_network=True, refresh=True)
         if not decision.allowed:
-            try:
-                page.goto("about:blank")
-            except Exception:
-                LOGGER.exception("Failed to quarantine blocked page")
+            self._quarantine_page(page, "Failed to quarantine blocked page")
             raise RequestError(403, f"Redirected to blocked host: {decision.reason}")
 
         try:
             frames = list(page.frames)
         except Exception:
-            try:
-                page.goto("about:blank")
-            except Exception:
-                LOGGER.exception("Failed to quarantine page with unreadable frame inventory")
+            self._quarantine_page(
+                page,
+                "Failed to quarantine page with unreadable frame inventory",
+            )
             raise RequestError(403, "Blocked: could not inspect page frames") from None
         if len(frames) > self._read_frame_limit:
-            try:
-                page.goto("about:blank")
-            except Exception:
-                LOGGER.exception("Failed to quarantine page with excessive frame count")
+            self._quarantine_page(page, "Failed to quarantine page with excessive frame count")
             raise RequestError(403, "Blocked: page has too many frames")
 
         for frame in frames:
@@ -400,21 +406,19 @@ class BrowserSession:
             except Exception:
                 frame_url = ""
             if not frame_url:
-                try:
-                    page.goto("about:blank")
-                except Exception:
-                    LOGGER.exception("Failed to quarantine page with unreadable frame URL")
+                self._quarantine_page(
+                    page,
+                    "Failed to quarantine page with unreadable frame URL",
+                )
                 raise RequestError(403, "Blocked: could not determine frame URL")
+            self._consume_dns_or_block(page, "Blocked: DNS validation budget exceeded")
             frame_decision = self.policy.validate(
                 frame_url,
                 allow_non_network=True,
                 refresh=True,
             )
             if not frame_decision.allowed:
-                try:
-                    page.goto("about:blank")
-                except Exception:
-                    LOGGER.exception("Failed to quarantine page with blocked frame")
+                self._quarantine_page(page, "Failed to quarantine page with blocked frame")
                 raise RequestError(403, f"Frame blocked: {frame_decision.reason}")
 
         return decision.normalized_url or url
@@ -466,8 +470,10 @@ class BrowserSession:
 
     def click(self, x: int, y: int) -> dict[str, bool]:
         x, y = self._point(x, y)
-        self._current_page().mouse.click(x, y)
-        self._check_final_url(self._current_page())
+        page = self._current_page()
+        self._check_final_url(page)
+        page.mouse.click(x, y)
+        self._check_final_url(page)
         return {"ok": True}
 
     def drag(
@@ -482,57 +488,69 @@ class BrowserSession:
         to_x, to_y = self._point(to_x, to_y)
         duration_ms = max(50, min(duration_ms, 5000))
         steps = max(5, min(100, duration_ms // 20))
-        mouse = self._current_page().mouse
+        page = self._current_page()
+        self._check_final_url(page)
+        mouse = page.mouse
         mouse.move(from_x, from_y)
         mouse.down()
         try:
             mouse.move(to_x, to_y, steps=steps)
         finally:
             mouse.up()
-        self._check_final_url(self._current_page())
+        self._check_final_url(page)
         return {"ok": True}
 
     def type_text(self, text: str) -> dict[str, bool]:
         if len(text) > self.config.max_type_text_chars:
             raise RequestError(400, "Text is too long")
-        self._current_page().keyboard.type(text)
-        self._check_final_url(self._current_page())
+        page = self._current_page()
+        self._check_final_url(page)
+        page.keyboard.type(text)
+        self._check_final_url(page)
         return {"ok": True}
 
     def press_key(self, key: str) -> dict[str, bool]:
         key = key.strip()
         if not key or len(key) > 100:
             raise RequestError(400, "Key must contain between 1 and 100 characters")
-        self._current_page().keyboard.press(key)
-        self._check_final_url(self._current_page())
+        page = self._current_page()
+        self._check_final_url(page)
+        page.keyboard.press(key)
+        self._check_final_url(page)
         return {"ok": True}
 
     def dom_fill(self, selector: str, value: str) -> dict[str, bool]:
         selector = self._validate_selector(selector)
-        self._current_page().locator(selector).first.fill(value, timeout=10000)
-        self._check_final_url(self._current_page())
+        page = self._current_page()
+        self._check_final_url(page)
+        page.locator(selector).first.fill(value, timeout=10000)
+        self._check_final_url(page)
         return {"ok": True}
 
     def dom_click(self, selector: str) -> dict[str, bool]:
         selector = self._validate_selector(selector)
-        self._current_page().locator(selector).first.click(timeout=10000)
-        self._check_final_url(self._current_page())
+        page = self._current_page()
+        self._check_final_url(page)
+        page.locator(selector).first.click(timeout=10000)
+        self._check_final_url(page)
         return {"ok": True}
 
     def dom_press(self, selector: str, key: str) -> dict[str, bool]:
         selector = self._validate_selector(selector)
         if not key or len(key) > 100:
             raise RequestError(400, "Invalid key")
-        self._current_page().locator(selector).first.press(key, timeout=10000)
-        self._check_final_url(self._current_page())
+        page = self._current_page()
+        self._check_final_url(page)
+        page.locator(selector).first.press(key, timeout=10000)
+        self._check_final_url(page)
         return {"ok": True}
 
     def dom_select(self, selector: str, value: str) -> dict[str, Any]:
         selector = self._validate_selector(selector)
-        selected = (
-            self._current_page().locator(selector).first.select_option(value=value, timeout=10000)
-        )
-        self._check_final_url(self._current_page())
+        page = self._current_page()
+        self._check_final_url(page)
+        selected = page.locator(selector).first.select_option(value=value, timeout=10000)
+        self._check_final_url(page)
         return {"ok": True, "selected": selected}
 
     @staticmethod

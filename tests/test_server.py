@@ -506,6 +506,56 @@ def test_frame_dns_budget_fails_closed(make_config):
     assert page.goto_calls == ["about:blank"]
 
 
+def test_click_checks_landing_before_browser_action(make_config):
+    session = BrowserSession(make_config())
+    page = FakePage(url="https://blocked.test/")
+    page.frames = []
+    session.page = page
+    session.context = types.SimpleNamespace(pages=[page])
+    clicked = []
+    page.mouse = types.SimpleNamespace(click=lambda x, y: clicked.append((x, y)))
+
+    class Policy:
+        def validate(self, url, *, allow_non_network=False, refresh=False):
+            return NavigationDecision(False, "denied", url)
+
+    session.policy = Policy()
+    with pytest.raises(RequestError, match="Redirected to blocked host"):
+        session.click(1, 1)
+    assert clicked == []
+    assert page.goto_calls == ["about:blank"]
+
+
+def test_read_frame_sweep_uses_shared_dns_budget(make_config):
+    session = BrowserSession(make_config())
+    session._frame_dns_max_events = 1
+    page = FakePage(url="https://ok.test/")
+    page.frames = [_Frame(page, "https://frame.test/")]
+
+    class Policy:
+        def validate(self, url, *, allow_non_network=False, refresh=False):
+            return NavigationDecision(True, "ok", url)
+
+    session.policy = Policy()
+    with pytest.raises(RequestError, match="DNS validation budget exceeded"):
+        session._check_final_url(page)
+    assert page.goto_calls == ["about:blank"]
+
+
+def test_quarantine_latch_avoids_recursive_frame_handler(make_config):
+    session = BrowserSession(make_config())
+    session._frame_dns_max_events = 0
+
+    class RecursivePage(FakePage):
+        def goto(self, url, **kwargs):
+            self.goto_calls.append(url)
+            session._on_frame_navigated(_Frame(self, url))
+
+    page = RecursivePage(url="https://ok.test/")
+    session._on_frame_navigated(_Frame(page, "https://ok.test/"))
+    assert page.goto_calls == ["about:blank"]
+
+
 def test_final_url_check_refreshes_policy_every_landing(make_config):
     session = BrowserSession(make_config())
     recorded = []
