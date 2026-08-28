@@ -237,6 +237,13 @@ class LifecyclePage:
         self.viewport = None
         self.goto_calls = []
         self.frames = []
+        self.handlers = {}
+
+    def on(self, event, callback):
+        self.handlers[event] = callback
+
+    def close(self):
+        self.closed = True
 
     def is_closed(self):
         return self.closed
@@ -259,6 +266,9 @@ class LifecyclePage:
 class LifecycleContext:
     def __init__(self, pages=None):
         self.pages = list(pages or [])
+
+    def new_cdp_session(self, page):
+        return types.SimpleNamespace(send=lambda *args, **kwargs: None, on=lambda *args: None)
 
     def new_page(self):
         page = LifecyclePage()
@@ -412,92 +422,122 @@ class _UnreadableFrame:
         raise RuntimeError("frame url unavailable")
 
 
-class _RouteResponse:
-    def __init__(self, status, headers=None):
-        self.status = status
-        self.headers = headers or {}
-
-
 class _RouteRequest:
-    def __init__(self, url, navigation=True):
+    def __init__(self, url):
         self.url = url
-        self._navigation = navigation
-
-    def is_navigation_request(self):
-        return self._navigation
 
 
 class _Route:
-    def __init__(self, response=None):
-        self.response = response
-        self.fetch_kwargs = []
+    def __init__(self):
         self.aborts = []
-        self.fulfilled = []
         self.continued = 0
-
-    def fetch(self, **kwargs):
-        self.fetch_kwargs.append(kwargs)
-        return self.response
 
     def abort(self, reason):
         self.aborts.append(reason)
-
-    def fulfill(self, **kwargs):
-        self.fulfilled.append(kwargs)
 
     def continue_(self):
         self.continued += 1
 
 
-def test_navigation_route_blocks_denied_redirect_before_browser_follows(make_config):
+class _CDP:
+    def __init__(self):
+        self.commands = []
+
+    def send(self, method, params):
+        self.commands.append((method, params))
+
+
+def _redirect_event(target, *, status=302):
+    return {
+        "requestId": "request-1",
+        "responseStatusCode": status,
+        "responseHeaders": [{"name": "Location", "value": target}],
+        "request": {"url": "http://127.0.0.1:9999/start"},
+    }
+
+
+def test_direct_route_allows_valid_request(make_config):
+    session = BrowserSession(make_config(allow_private_network_navigation=True))
+    route = _Route()
+
+    session._route_request(route, _RouteRequest("http://127.0.0.1:9999/start"))
+
+    assert route.continued == 1
+    assert route.aborts == []
+
+
+def test_direct_route_blocks_denied_request(make_config):
     session = BrowserSession(
         make_config(allow_private_network_navigation=True, denied_hosts=("localhost",))
     )
-    route = _Route(_RouteResponse(302, {"location": "http://localhost:9999/blocked"}))
-    request = _RouteRequest("http://127.0.0.1:9999/start")
+    route = _Route()
 
-    session._route_request(route, request)
+    session._route_request(route, _RouteRequest("http://localhost:9999/blocked"))
 
-    assert route.fetch_kwargs == [{"max_redirects": 0}]
+    assert route.continued == 0
     assert route.aborts == ["blockedbyclient"]
-    assert route.fulfilled == []
 
 
-def test_navigation_route_redirect_uses_shared_dns_budget(make_config):
+def test_redirect_response_blocks_denied_target_before_follow(make_config):
+    session = BrowserSession(
+        make_config(allow_private_network_navigation=True, denied_hosts=("localhost",))
+    )
+    cdp = _CDP()
+
+    session._on_redirect_response_paused(
+        cdp,
+        _redirect_event("http://localhost:9999/blocked"),
+    )
+
+    assert cdp.commands == [
+        (
+            "Fetch.failRequest",
+            {"requestId": "request-1", "errorReason": "BlockedByClient"},
+        )
+    ]
+
+
+def test_redirect_response_uses_shared_dns_budget(make_config):
     session = BrowserSession(make_config(allow_private_network_navigation=True))
     session._frame_dns_max_events = 0
-    route = _Route(_RouteResponse(302, {"location": "http://127.0.0.1:9999/next"}))
-    request = _RouteRequest("http://127.0.0.1:9999/start")
+    cdp = _CDP()
 
-    session._route_request(route, request)
+    session._on_redirect_response_paused(
+        cdp,
+        _redirect_event("http://127.0.0.1:9999/next"),
+    )
 
-    assert route.fetch_kwargs == [{"max_redirects": 0}]
-    assert route.aborts == ["blockedbyclient"]
-    assert route.fulfilled == []
+    assert cdp.commands == [
+        (
+            "Fetch.failRequest",
+            {"requestId": "request-1", "errorReason": "BlockedByClient"},
+        )
+    ]
 
 
-def test_navigation_route_fulfills_allowed_response(make_config):
+def test_redirect_response_continues_allowed_target(make_config):
     session = BrowserSession(make_config(allow_private_network_navigation=True))
-    response = _RouteResponse(200, {})
-    route = _Route(response)
-    request = _RouteRequest("http://127.0.0.1:9999/start")
+    cdp = _CDP()
 
-    session._route_request(route, request)
+    session._on_redirect_response_paused(
+        cdp,
+        _redirect_event("http://127.0.0.1:9999/next"),
+    )
 
-    assert route.fetch_kwargs == [{"max_redirects": 0}]
-    assert route.aborts == []
-    assert route.fulfilled == [{"response": response}]
+    assert cdp.commands == [("Fetch.continueResponse", {"requestId": "request-1"})]
 
 
-def test_non_navigation_route_keeps_continue_behavior(make_config):
+def test_non_redirect_response_continues_without_dns_budget(make_config):
     session = BrowserSession(make_config(allow_private_network_navigation=True))
-    route = _Route()
-    request = _RouteRequest("http://127.0.0.1:9999/app.js", navigation=False)
+    session._frame_dns_max_events = 0
+    cdp = _CDP()
 
-    session._route_request(route, request)
+    session._on_redirect_response_paused(
+        cdp,
+        _redirect_event("", status=200),
+    )
 
-    assert route.continued == 1
-    assert route.fetch_kwargs == []
+    assert cdp.commands == [("Fetch.continueResponse", {"requestId": "request-1"})]
 
 
 def test_startup_final_url_unreadable_fails_closed(make_config):

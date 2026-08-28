@@ -93,12 +93,14 @@ class BrowserSession:
 
         pages = [page for page in self.context.pages if not page.is_closed()]
         self.page = pages[0] if pages else self.context.new_page()
-        # Attach frame navigation guard to each existing page
+        # Attach browser-triggered landing guards to each existing page.
         for p in pages:
+            self._attach_redirect_response_guard(p)
             try:
                 p.on("framenavigated", self._on_frame_navigated)
             except Exception:
                 LOGGER.exception("Failed to attach frame navigation handler to existing page")
+        self._attach_redirect_response_guard(self.page)
         self.page.set_viewport_size(self.viewport)
         self.page.goto(
             decision.normalized_url or self.config.base_url,
@@ -129,48 +131,74 @@ class BrowserSession:
 
     def _route_request(self, route, request) -> None:
         decision = self.policy.validate(request.url, allow_non_network=True)
-        if not decision.allowed:
-            LOGGER.warning("Blocked browser request to %s: %s", request.url, decision.reason)
-            route.abort("blockedbyclient")
-            return
-
-        try:
-            is_navigation = request.is_navigation_request()
-        except Exception:
-            is_navigation = False
-        if not is_navigation:
+        if decision.allowed:
             route.continue_()
             return
+        LOGGER.warning("Blocked browser request to %s: %s", request.url, decision.reason)
+        route.abort("blockedbyclient")
 
-        try:
-            response = route.fetch(max_redirects=0)
-        except Exception:
-            LOGGER.exception("Failed to inspect browser navigation response")
-            route.abort("failed")
+    def _attach_redirect_response_guard(self, page) -> None:
+        if getattr(page, "_hat_redirect_guard", None) is not None:
             return
+        try:
+            cdp = self.context.new_cdp_session(page)
+            cdp.send(
+                "Fetch.enable",
+                {"patterns": [{"urlPattern": "*", "requestStage": "Response"}]},
+            )
+            cdp.on(
+                "Fetch.requestPaused",
+                lambda event, session=cdp: self._on_redirect_response_paused(session, event),
+            )
+        except Exception as exc:
+            raise RuntimeError("Failed to attach redirect response guard") from exc
+        page._hat_redirect_guard = cdp
 
-        if response.status in {301, 302, 303, 307, 308}:
-            location = response.headers.get("location", "")
-            if location:
-                target = urljoin(request.url, location)
-                if not self._consume_frame_dns_budget():
-                    LOGGER.warning(
-                        "Blocked browser redirect to %s: DNS validation budget exceeded",
-                        target,
-                    )
-                    route.abort("blockedbyclient")
-                    return
-                redirect_decision = self.policy.validate(target, refresh=True)
-                if not redirect_decision.allowed:
-                    LOGGER.warning(
-                        "Blocked browser redirect to %s: %s",
-                        target,
-                        redirect_decision.reason,
-                    )
-                    route.abort("blockedbyclient")
-                    return
-
-        route.fulfill(response=response)
+    def _on_redirect_response_paused(self, cdp, event: dict[str, Any]) -> None:
+        request_id = event.get("requestId")
+        if not request_id:
+            return
+        try:
+            status = int(event.get("responseStatusCode") or 0)
+            if status in {301, 302, 303, 307, 308}:
+                headers = {
+                    str(header.get("name", "")).lower(): str(header.get("value", ""))
+                    for header in event.get("responseHeaders", [])
+                }
+                location = headers.get("location", "")
+                if location:
+                    source = str(event.get("request", {}).get("url", ""))
+                    target = urljoin(source, location)
+                    if not self._consume_frame_dns_budget():
+                        LOGGER.warning(
+                            "Blocked browser redirect to %s: DNS validation budget exceeded",
+                            target,
+                        )
+                        cdp.send(
+                            "Fetch.failRequest",
+                            {"requestId": request_id, "errorReason": "BlockedByClient"},
+                        )
+                        return
+                    decision = self.policy.validate(target, refresh=True)
+                    if not decision.allowed:
+                        LOGGER.warning(
+                            "Blocked browser redirect to %s: %s",
+                            target,
+                            decision.reason,
+                        )
+                        cdp.send(
+                            "Fetch.failRequest",
+                            {"requestId": request_id, "errorReason": "BlockedByClient"},
+                        )
+                        return
+            cdp.send("Fetch.continueResponse", {"requestId": request_id})
+        except Exception:
+            LOGGER.exception("Redirect response validation failed")
+            with contextlib.suppress(Exception):
+                cdp.send(
+                    "Fetch.failRequest",
+                    {"requestId": request_id, "errorReason": "BlockedByClient"},
+                )
 
     def _route_websocket(self, websocket_route) -> None:
         decision = self.policy.validate_websocket(websocket_route.url)
@@ -198,12 +226,15 @@ class BrowserSession:
             page.set_viewport_size(self.viewport)
         except Exception:
             LOGGER.exception("Failed to size new page")
-        # Cover browser-triggered navigations (click/DOM/meta-refresh/JS)
-        # that bypass explicit control methods: validate every page attach.
+        # Cover browser-triggered redirects and navigations on every new page.
         try:
+            self._attach_redirect_response_guard(page)
             page.on("framenavigated", self._on_frame_navigated)
         except Exception:
-            LOGGER.exception("Failed to attach frame navigation handler")
+            LOGGER.exception("Failed to attach browser landing guards")
+            with contextlib.suppress(Exception):
+                page.close()
+            return
         if self.page is None or self.page.is_closed() or self.page not in self._pages():
             self.page = page
 
