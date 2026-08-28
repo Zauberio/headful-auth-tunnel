@@ -153,6 +153,13 @@ class BrowserSession:
             location = response.headers.get("location", "")
             if location:
                 target = urljoin(request.url, location)
+                if not self._consume_frame_dns_budget():
+                    LOGGER.warning(
+                        "Blocked browser redirect to %s: DNS validation budget exceeded",
+                        target,
+                    )
+                    route.abort("blockedbyclient")
+                    return
                 redirect_decision = self.policy.validate(target, refresh=True)
                 if not redirect_decision.allowed:
                     LOGGER.warning(

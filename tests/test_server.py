@@ -463,6 +463,19 @@ def test_navigation_route_blocks_denied_redirect_before_browser_follows(make_con
     assert route.fulfilled == []
 
 
+def test_navigation_route_redirect_uses_shared_dns_budget(make_config):
+    session = BrowserSession(make_config(allow_private_network_navigation=True))
+    session._frame_dns_max_events = 0
+    route = _Route(_RouteResponse(302, {"location": "http://127.0.0.1:9999/next"}))
+    request = _RouteRequest("http://127.0.0.1:9999/start")
+
+    session._route_request(route, request)
+
+    assert route.fetch_kwargs == [{"max_redirects": 0}]
+    assert route.aborts == ["blockedbyclient"]
+    assert route.fulfilled == []
+
+
 def test_navigation_route_fulfills_allowed_response(make_config):
     session = BrowserSession(make_config(allow_private_network_navigation=True))
     response = _RouteResponse(200, {})
