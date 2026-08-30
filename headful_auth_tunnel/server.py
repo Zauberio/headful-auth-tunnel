@@ -758,8 +758,8 @@ class SessionStore:
 
     def create(self) -> str:
         token = secrets.token_urlsafe(32)
-        now = time.time()
         with self._lock:
+            now = time.time()
             self._purge(now)
             # Evict the least-recently-USED session, not the oldest-created:
             # a long-lived active session must not be killed by new logins.
@@ -783,8 +783,8 @@ class SessionStore:
     def valid(self, token: str | None) -> bool:
         if not token:
             return False
-        now = time.time()
         with self._lock:
+            now = time.time()
             self._purge(now)
             expires = self._sessions.get(token)
             ok = expires is not None and expires > now
@@ -980,7 +980,7 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                     # revoked.
                     existing = self._cookie_value()
                     if existing and sessions.valid(existing):
-                        self._redirect("/")
+                        self._redirect("/", {"Set-Cookie": self._session_cookie(existing)})
                         return
                     session_id = sessions.create()
                     self._redirect("/", {"Set-Cookie": self._session_cookie(session_id)})
@@ -1041,7 +1041,7 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                     return
                 existing = self._cookie_value()
                 if existing and sessions.valid(existing):
-                    self._redirect("/")
+                    self._redirect("/", {"Set-Cookie": self._session_cookie(existing)})
                     return
                 session_id = sessions.create()
                 self._redirect("/", {"Set-Cookie": self._session_cookie(session_id)})

@@ -167,6 +167,65 @@ def test_session_store_expiry():
     assert not store.valid(token)
 
 
+def test_session_store_evicts_least_recently_used():
+    store = SessionStore()
+    tokens = [store.create() for _ in range(128)]
+    assert store.valid(tokens[0])
+    extra = store.create()
+    assert store.valid(tokens[0])
+    assert store.valid(extra)
+    assert not store.valid(tokens[1])
+    assert len(store._sessions) == 128
+    assert set(store._sessions) == set(store._last_used)
+
+
+def test_token_login_reuses_session_and_reemits_cookie(make_config):
+    config = make_config(allow_query_token=True)
+    server, thread = start_server(config)
+    try:
+        encoded = urlencode({"token": config.auth_token})
+        status, headers, _ = request(
+            server,
+            "POST",
+            "/session",
+            encoded,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert status == 303
+        cookie = headers["Set-Cookie"]
+        cookie_pair = cookie.split(";", 1)[0]
+        session_id = cookie_pair.split("=", 1)[1]
+
+        status, headers, _ = request(
+            server,
+            "POST",
+            "/session",
+            encoded,
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Cookie": cookie_pair,
+            },
+        )
+        assert status == 303
+        assert "Set-Cookie" in headers
+        reused = headers["Set-Cookie"].split(";", 1)[0].split("=", 1)[1]
+        assert reused == session_id
+
+        status, headers, _ = request(
+            server,
+            "GET",
+            f"/?token={config.auth_token}",
+            headers={"Cookie": cookie_pair},
+        )
+        assert status == 303
+        assert "Set-Cookie" in headers
+        assert headers["Set-Cookie"].split(";", 1)[0].split("=", 1)[1] == session_id
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
 def test_viewport_bounds_follow_runtime_resolution(make_config):
     session = BrowserSession(make_config(screen_width=3840, screen_height=2160))
     assert session._point(3839, 2159) == (3839, 2159)
