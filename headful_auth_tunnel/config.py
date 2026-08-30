@@ -101,6 +101,7 @@ class Config:
     tls_key: Path | None
     max_dom_text_chars: int
     max_dom_elements: int
+    max_concurrent_connections: int = 16
 
     @property
     def tls_enabled(self) -> bool:
@@ -166,4 +167,5 @@ class Config:
             tls_key=tls_key,
             max_dom_text_chars=_env_int("MAX_DOM_TEXT_CHARS", 20000, 1000, 250000),
             max_dom_elements=_env_int("MAX_DOM_ELEMENTS", 250, 10, 5000),
+            max_concurrent_connections=_env_int("MAX_CONCURRENT_CONNECTIONS", 16, 1, 256),
         )
