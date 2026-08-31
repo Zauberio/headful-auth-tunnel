@@ -792,6 +792,17 @@ class SessionStore:
                 self._last_used[token] = now
             return ok
 
+    def remaining_ttl(self, token: str | None) -> int:
+        if not token:
+            return 0
+        with self._lock:
+            now = time.time()
+            self._purge(now)
+            expires = self._sessions.get(token)
+            if expires is None or expires <= now:
+                return 0
+            return max(1, int(expires - now))
+
     def revoke(self, token: str | None) -> None:
         if not token:
             return
@@ -918,7 +929,7 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             self._send_json(401, {"error": "Authentication required"})
             return False
 
-        def _session_cookie(self, session_id: str, *, clear: bool = False) -> str:
+        def _session_cookie(self, session_id: str, *, clear: bool = False, max_age: int | None = None) -> str:
             parts = [
                 f"{config.session_cookie_name}={session_id}",
                 "Path=/",
@@ -928,7 +939,8 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             if clear:
                 parts.extend(["Max-Age=0", "Expires=Thu, 01 Jan 1970 00:00:00 GMT"])
             else:
-                parts.append("Max-Age=43200")
+                age = sessions.ttl_seconds if max_age is None else max(0, int(max_age))
+                parts.append(f"Max-Age={age}")
             forwarded_https = (
                 config.trust_forwarded_proto
                 and self.headers.get("X-Forwarded-Proto", "").strip().lower() == "https"
@@ -980,7 +992,7 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                     # revoked.
                     existing = self._cookie_value()
                     if existing and sessions.valid(existing):
-                        self._redirect("/", {"Set-Cookie": self._session_cookie(existing)})
+                        self._redirect("/", {"Set-Cookie": self._session_cookie(existing, max_age=sessions.remaining_ttl(existing))})
                         return
                     session_id = sessions.create()
                     self._redirect("/", {"Set-Cookie": self._session_cookie(session_id)})
@@ -1041,7 +1053,7 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                     return
                 existing = self._cookie_value()
                 if existing and sessions.valid(existing):
-                    self._redirect("/", {"Set-Cookie": self._session_cookie(existing)})
+                    self._redirect("/", {"Set-Cookie": self._session_cookie(existing, max_age=sessions.remaining_ttl(existing))})
                     return
                 session_id = sessions.create()
                 self._redirect("/", {"Set-Cookie": self._session_cookie(session_id)})

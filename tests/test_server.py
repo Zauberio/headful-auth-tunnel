@@ -37,10 +37,11 @@ class FakeController:
         return {"ok": True, "method": method, **kwargs}
 
 
-def start_server(config):
+def start_server(config, sessions=None):
+    store = sessions if sessions is not None else SessionStore()
     server = TunnelHTTPServer(
         ("127.0.0.1", 0),
-        make_handler(config, FakeController(), SessionStore()),
+        make_handler(config, FakeController(), store),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -220,6 +221,63 @@ def test_token_login_reuses_session_and_reemits_cookie(make_config):
         assert status == 303
         assert "Set-Cookie" in headers
         assert headers["Set-Cookie"].split(";", 1)[0].split("=", 1)[1] == session_id
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _cookie_max_age(header: str) -> int:
+    for part in header.split(";"):
+        part = part.strip()
+        if part.lower().startswith("max-age="):
+            return int(part.split("=", 1)[1])
+    raise AssertionError(f"no Max-Age in {header}")
+
+
+def test_token_login_reuse_preserves_remaining_ttl(make_config):
+    config = make_config(allow_query_token=True)
+    store = SessionStore()
+    server, thread = start_server(config, store)
+    try:
+        encoded = urlencode({"token": config.auth_token})
+        status, headers, _ = request(
+            server,
+            "POST",
+            "/session",
+            encoded,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert status == 303
+        cookie = headers["Set-Cookie"]
+        cookie_pair = cookie.split(";", 1)[0]
+        session_id = cookie_pair.split("=", 1)[1]
+        store._sessions[session_id] = time.time() + 7
+
+        status, headers, _ = request(
+            server,
+            "POST",
+            "/session",
+            encoded,
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Cookie": cookie_pair,
+            },
+        )
+        assert status == 303
+        age = _cookie_max_age(headers["Set-Cookie"])
+        assert 1 <= age <= 7, age
+        assert age != store.ttl_seconds
+
+        status, headers, _ = request(
+            server,
+            "GET",
+            f"/?token={config.auth_token}",
+            headers={"Cookie": cookie_pair},
+        )
+        assert status == 303
+        age = _cookie_max_age(headers["Set-Cookie"])
+        assert 1 <= age <= 7, age
     finally:
         server.shutdown()
         server.server_close()
