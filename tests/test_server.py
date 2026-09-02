@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import http.client
 import json
+import socket
 import threading
 import time
 import types
@@ -766,10 +768,8 @@ def test_thread_cap_rejects_excess_trickled_connections(make_config):
         else:
             time.sleep(0.1)
             excess.settimeout(1)
-            try:
+            with contextlib.suppress(ConnectionResetError):
                 assert excess.recv(16) == b""
-            except ConnectionResetError:
-                pass
 
         for sock in trickles:
             sock.close()
