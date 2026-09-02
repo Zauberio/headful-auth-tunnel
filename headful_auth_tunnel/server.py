@@ -929,7 +929,9 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             self._send_json(401, {"error": "Authentication required"})
             return False
 
-        def _session_cookie(self, session_id: str, *, clear: bool = False, max_age: int | None = None) -> str:
+        def _session_cookie(
+            self, session_id: str, *, clear: bool = False, max_age: int | None = None
+        ) -> str:
             parts = [
                 f"{config.session_cookie_name}={session_id}",
                 "Path=/",
@@ -992,7 +994,9 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                     # revoked.
                     existing = self._cookie_value()
                     if existing and sessions.valid(existing):
-                        self._redirect("/", {"Set-Cookie": self._session_cookie(existing, max_age=sessions.remaining_ttl(existing))})
+                        ttl = sessions.remaining_ttl(existing)
+                        cookie = self._session_cookie(existing, max_age=ttl)
+                        self._redirect("/", {"Set-Cookie": cookie})
                         return
                     session_id = sessions.create()
                     self._redirect("/", {"Set-Cookie": self._session_cookie(session_id)})
@@ -1053,7 +1057,9 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                     return
                 existing = self._cookie_value()
                 if existing and sessions.valid(existing):
-                    self._redirect("/", {"Set-Cookie": self._session_cookie(existing, max_age=sessions.remaining_ttl(existing))})
+                    ttl = sessions.remaining_ttl(existing)
+                    cookie = self._session_cookie(existing, max_age=ttl)
+                    self._redirect("/", {"Set-Cookie": cookie})
                     return
                 session_id = sessions.create()
                 self._redirect("/", {"Set-Cookie": self._session_cookie(session_id)})
