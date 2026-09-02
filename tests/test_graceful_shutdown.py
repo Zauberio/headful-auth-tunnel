@@ -166,30 +166,24 @@ def _finish(proc, lines, reader, close_marker: Path):
     if returncode != 0:
         return False, f"exit code {returncode} (expected 0)\n--- output ---\n{output[-1500:]}"
     if "graceful shutdown" not in output:
-        return False, (
-            "graceful-shutdown log line missing\n--- output ---\n" + output[-1500:]
-        )
+        return False, ("graceful-shutdown log line missing\n--- output ---\n" + output[-1500:])
     if not close_marker.exists():
         return False, "session-close marker missing (shutdown path incomplete)"
-    return True, f"exit 0, graceful shutdown logged, session closed"
+    return True, "exit 0, graceful shutdown logged, session closed"
 
 
 def _scenario_sigterm_during_startup(tmpdir: Path):
     """SIGTERM while the browser worker is still starting."""
     proc = _spawn_server(tmpdir, hold_start=2.5, port=_free_port())
     lines: list[str] = []
-    reader = threading.Thread(
-        target=_read_output, args=(proc, lines, []), daemon=True
-    )
+    reader = threading.Thread(target=_read_output, args=(proc, lines, []), daemon=True)
     reader.start()
     start_marker = tmpdir / "start.marker"
     deadline = time.monotonic() + 20
     while not start_marker.exists():
         if proc.poll() is not None:
             reader.join(timeout=5)
-            return False, (
-                "child exited before browser startup:\n" + "".join(lines[-20:])
-            )
+            return False, ("child exited before browser startup:\n" + "".join(lines[-20:]))
         if time.monotonic() > deadline:
             proc.kill()
             proc.wait()
@@ -205,7 +199,8 @@ def _scenario_sigterm_while_serving(tmpdir: Path):
     lines: list[str] = []
     listening = threading.Event()
     reader = threading.Thread(
-        target=_read_output, args=(proc, lines, [("listening on", listening)]),
+        target=_read_output,
+        args=(proc, lines, [("listening on", listening)]),
         daemon=True,
     )
     reader.start()
@@ -213,9 +208,7 @@ def _scenario_sigterm_while_serving(tmpdir: Path):
         proc.kill()
         proc.wait()
         reader.join(timeout=5)
-        return False, (
-            "server never reported listening:\n" + "".join(lines[-20:])
-        )
+        return False, ("server never reported listening:\n" + "".join(lines[-20:]))
     try:
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         connection.request("GET", "/health")
