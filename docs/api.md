@@ -59,7 +59,7 @@ With `EXPOSE_HEALTH_DETAILS=true`, browser and tab counts are included.
 
 ### `GET /meta`
 
-Returns the active URL/title, viewport, locale, timezone, browser mode, persistent-profile flag and browser instance identifier.
+Returns the active URL/title, viewport, locale, timezone, browser presentation mode, backend/owner metadata, persistent-profile flag and tunnel browser-session identifier. `browser_backend` is `managed` or `cdp`; `browser_owner` is `tunnel` or `external`. In CDP mode `persistent_profile` is `null` because profile persistence belongs to the external owner.
 
 ### `GET /screenshot`
 
@@ -67,7 +67,8 @@ Returns a PNG of the current viewport.
 
 ### `GET /tabs`
 
-Returns all open pages:
+Returns pages enrolled in this tunnel session. In managed mode this is the tunnel-owned context. In CDP mode it is the selected target tab plus popups opened from that tab; unrelated tabs in the external Chromium are intentionally omitted.
+
 
 ```json
 {

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.3 - 2026-09-03
+
+### Browser ownership
+
+- Add `BROWSER_MODE=managed|cdp` and separate browser lifecycle ownership from the authenticated control surface.
+- Add attach-only CDP mode with `CDP_ENDPOINT` and explicit `CDP_TARGET` tab selection.
+- In CDP mode, never open `PROFILE_DIR`, launch Chromium or close the externally owned browser on detach.
+- Scope the tunnel to the selected external tab and its descendant popups instead of adopting unrelated browser tabs.
+- Fail closed if the attached external tab disappears instead of creating a replacement tab in a browser the tunnel does not own.
+- Preserve the v0.4.2 redirect, frame-navigation and final-landing guards for attached pages.
+- Add `/meta` fields `browser_backend` and `browser_owner`.
+- Make Playwright an explicit package dependency for CDP attachment.
+- Fix package/server version metadata so the release reports `0.4.3` consistently.
+
 ## 0.4.1 - 2026-08-07
 
 - Add opt-in `TRUST_FORWARDED_PROTO` support so deployments behind a controlled HTTPS reverse proxy can still emit `Secure` session cookies.

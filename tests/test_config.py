@@ -10,6 +10,9 @@ RELEVANT_ENV = {
     "AUTH_TOKEN",
     "TOKEN_FILE",
     "PROFILE_DIR",
+    "BROWSER_MODE",
+    "CDP_ENDPOINT",
+    "CDP_TARGET",
     "SCREEN_WIDTH",
     "SCREEN_HEIGHT",
     "LOCALE",
@@ -78,4 +81,34 @@ def test_partial_tls_configuration_is_rejected(monkeypatch, tmp_path):
     monkeypatch.setenv("TLS_CERT", str(tmp_path / "cert.pem"))
 
     with pytest.raises(ValueError, match="configured together"):
+        Config.from_env()
+
+
+def test_cdp_mode_requires_endpoint_and_does_not_create_profile(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_FILE", str(tmp_path / "token"))
+    profile = tmp_path / "must-not-exist"
+    monkeypatch.setenv("PROFILE_DIR", str(profile))
+    monkeypatch.setenv("BROWSER_MODE", "cdp")
+
+    with pytest.raises(ValueError, match="CDP_ENDPOINT"):
+        Config.from_env()
+
+    monkeypatch.setenv("CDP_ENDPOINT", "http://127.0.0.1:9223")
+    monkeypatch.setenv("CDP_TARGET", "aliexpress")
+    config = Config.from_env()
+
+    assert config.browser_mode == "cdp"
+    assert config.cdp_endpoint == "http://127.0.0.1:9223"
+    assert config.cdp_target == "aliexpress"
+    assert config.profile_dir is None
+    assert not profile.exists()
+
+
+def test_invalid_browser_mode_is_rejected(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_FILE", str(tmp_path / "token"))
+    monkeypatch.setenv("BROWSER_MODE", "other")
+
+    with pytest.raises(ValueError, match="BROWSER_MODE"):
         Config.from_env()

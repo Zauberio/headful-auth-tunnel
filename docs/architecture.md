@@ -2,7 +2,7 @@
 
 ## Overview
 
-Headful Auth Tunnel exposes one persistent, human-operated Chromium browser through a small authenticated HTTP service.
+Headful Auth Tunnel exposes one human-operated browser surface through a small authenticated HTTP service. Browser ownership is explicit and selectable.
 
 ```text
 remote browser or API client
@@ -15,28 +15,63 @@ ThreadingHTTPServer
         v
 single browser worker thread
         |
-        | Scrapling StealthySession / persistent Chromium context
         v
+BrowserBackend
+   |                     |
+   | managed             | cdp
+   v                     v
+Scrapling             Playwright CDP client
+StealthySession           |
+   |                      v
+   v                 externally owned Chromium
+managed Chromium      and persistent profile
+   |
+   v
 PROFILE_DIR
 ```
 
-The browser is deliberately headful. Xvfb supplies the display on a headless Linux host, but Chromium still runs in normal headed mode.
+The HTTP/API surface is the same in both modes. The browser worker remains the only thread that touches Playwright/browser objects.
 
-## Single browser instance
+## Browser backends
 
-Each tunnel process owns exactly one `StealthySession`, one persistent browser context and one active-page pointer.
+### Managed backend
 
-All HTTP requests that touch Playwright are converted into commands and executed on the browser worker thread. This prevents cross-thread Playwright access while still allowing the HTTP server to serve multiple clients concurrently.
+`BROWSER_MODE=managed` is the standalone/default mode. The tunnel launches one headed Chromium through Scrapling `StealthySession`, owns its lifecycle, and reuses `PROFILE_DIR` across restarts. Xvfb supplies the display on a headless Linux host.
 
-Tabs and popups are pages inside the same browser context. Focusing a tab changes the active-page pointer; it does not create a second browser.
+The tunnel owns exactly one persistent browser context. Tabs and popups are pages inside that context. Stopping the tunnel closes the browser it owns.
+
+### CDP attach backend
+
+`BROWSER_MODE=cdp` connects to `CDP_ENDPOINT` using Playwright's Chrome DevTools Protocol support. The external service remains the sole owner of the Chromium process and persistent profile. The tunnel does not open `PROFILE_DIR`, launch Chromium, or call `browser.close()` on detach.
+
+`CDP_TARGET` selects an existing tab by case-insensitive URL/title substring. If the external Chromium has zero or multiple tabs, a target is required. An unmatched target fails closed. Only the selected tab and popups opened from that tab are enrolled in the tunnel; unrelated tabs remain outside its `/tabs` and control surface.
+
+At attach time the existing tab's current URL is validated against the destination policy. The tunnel reads the existing viewport instead of imposing startup viewport/locale/timezone settings on the external owner. Existing v0.4.2 redirect, frame-navigation and landing-page guards remain active on the enrolled page.
+
+If the enrolled external tab disappears, CDP mode fails closed rather than creating an arbitrary replacement tab in a browser it does not own.
+
+## Ownership invariant
+
+The durable rule is **one live owner per Chromium profile**, not “one control client per browser.”
+
+- In managed mode, the tunnel is the owner.
+- In CDP mode, the external runtime is the owner and the tunnel is a client.
+- Multiple CDP clients can technically attach to one externally owned browser, but operators must coordinate actions to avoid competing clicks/navigation.
+- No client should open the browser's user-data directory independently while the owner is running.
 
 ## Persistent profile
 
-`PROFILE_DIR` is passed to Chromium as its persistent user-data directory. It contains cookies, local storage, IndexedDB, service-worker state and other browser identity data.
+In managed mode, `PROFILE_DIR` contains cookies, local storage, IndexedDB, service-worker state and other browser identity data. Reuse the same directory to preserve authentication across restarts, with exactly one browser process opening it at a time.
 
-The same directory is reused after a tunnel restart. Chromium prevents two processes from opening the same profile concurrently, so a profile must have a single owner at a time.
+In CDP mode, profile location and persistence are external concerns. `PROFILE_DIR` is ignored and never opened by the tunnel.
 
-Treat the profile directory as credential material. Never commit, copy into a container image or expose it through the HTTP API.
+Treat any persistent browser profile as credential material. Never commit it, copy it into a container image, or expose it through the HTTP API.
+
+## Command serialization
+
+All HTTP requests that touch the browser are converted into commands and executed on the single browser worker thread. This prevents cross-thread Playwright access while still allowing the HTTP server to serve multiple clients concurrently.
+
+The command queue serializes actions inside this tunnel instance. It does not coordinate unrelated external CDP clients; deployment-level coordination is still required when another automation client shares the same browser.
 
 ## Authentication flow
 

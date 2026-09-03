@@ -1,6 +1,6 @@
 # headful-auth-tunnel
 
-A small, self-hosted remote-control tunnel for **human-operated headful browser sessions** with persistent profiles.
+A small, self-hosted remote-control tunnel for **human-operated headful browser sessions**, either with a tunnel-owned persistent Chromium profile or by attaching to an externally owned Chromium over CDP.
 
 It is useful when automation runs on a headless machine, but a person must occasionally open the real browser, authenticate an account they are authorised to use, and leave the resulting profile available for later permitted automation.
 
@@ -70,7 +70,7 @@ cp .env.example .env
 
 Open `http://127.0.0.1:19192/`, paste the token into the login form, and operate the browser through the screenshot UI.
 
-The published defaults remain local and compatible:
+By default the tunnel uses `BROWSER_MODE=managed`: it launches and owns Chromium and reuses `PROFILE_DIR`. The published defaults remain local and compatible:
 
 ```dotenv
 BIND_HOST=127.0.0.1
@@ -89,6 +89,20 @@ Stop with:
 ```bash
 ./scripts/stop.sh
 ```
+
+### Attach to an existing Chromium
+
+Use CDP mode when another service already owns the Chromium process and persistent profile. The tunnel becomes a control client only: it does not open `PROFILE_DIR`, launch Chromium or close the external browser when the tunnel stops.
+
+```dotenv
+BROWSER_MODE=cdp
+CDP_ENDPOINT=http://127.0.0.1:9223
+CDP_TARGET=example.com
+```
+
+`CDP_TARGET` is matched case-insensitively against open tab URLs and titles. It is required whenever the external browser has zero or multiple open tabs; an unmatched target fails closed. The tunnel exposes only the selected tab plus popups opened from that tab, so unrelated tabs in the same external Chromium are not adopted accidentally.
+
+The attached tab's current URL must pass the same destination policy as normal navigation. Startup viewport, locale, timezone and browser executable settings are not imposed on the externally owned browser at attach time. Explicit runtime controls such as `/viewport` still act on the selected tab when requested.
 
 ## Resolution and scaling
 
@@ -165,7 +179,7 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:19192/meta
 
 The web UI is a live view of the complete headful browser. Login pages, password fields, OTP prompts, consent dialogs and popups remain visible and controllable exactly as the site renders them.
 
-There is one live Chromium instance per running tunnel process. Every HTTP/UI action is queued into that same browser context. `PROFILE_DIR` is reused after restarts, preserving cookies, local storage, IndexedDB and authenticated sessions. Chromium also prevents two processes from opening the same profile concurrently.
+Browser ownership depends on the backend. In `managed` mode, one tunnel process owns one live Chromium context and reuses `PROFILE_DIR` across restarts. In `cdp` mode, Chromium and its profile remain owned by an external service; the tunnel attaches to one selected tab and never closes the external browser. In both modes, every HTTP/UI action is serialized through the same browser worker thread.
 
 The UI supports direct click/drag, navigation, typing, key presses, viewport changes, tab selection and selector-based editing.
 
@@ -203,9 +217,12 @@ Sensitive values are omitted unless `include_sensitive_values` is explicitly ena
 |---|---:|---|
 | `BIND_HOST` | `127.0.0.1` | HTTP bind address. Prefer a specific LAN/VPN IP for remote access. |
 | `PORT` | `19192` | HTTP(S) port. |
-| `BASE_URL` | `https://example.com` | Initial page. Must pass the destination policy. |
-| `PROFILE_DIR` | `~/.headful-auth-tunnel/profile` | Persistent profile for the Python entry point; helper script uses `./profile`. |
-| `BROWSER_EXECUTABLE_PATH` | unset | Optional Chromium/Chrome executable to use instead of Patchright's bundled browser. |
+| `BASE_URL` | `https://example.com` | Initial page in managed mode. In CDP mode the existing attached tab is used instead. |
+| `BROWSER_MODE` | `managed` | `managed` launches/owns Chromium; `cdp` attaches to an externally owned Chromium. |
+| `CDP_ENDPOINT` | unset | Required in CDP mode, for example `http://127.0.0.1:9223`. |
+| `CDP_TARGET` | unset | URL/title substring selecting the attached tab. Required unless the external browser has exactly one open tab. |
+| `PROFILE_DIR` | `~/.headful-auth-tunnel/profile` | Persistent profile in managed mode only; ignored and never opened in CDP mode. |
+| `BROWSER_EXECUTABLE_PATH` | unset | Optional managed-mode Chromium/Chrome executable to use instead of Patchright's bundled browser. |
 | `TOKEN_FILE` | XDG state directory | Generated token path; helper script uses `./runtime/token`. |
 | `AUTH_TOKEN` | unset | Inline token override, minimum 24 characters. Prefer `TOKEN_FILE`. |
 | `SCREEN_WIDTH` | `1440` | Startup viewport width, 320–7680. |
@@ -291,7 +308,11 @@ The process inside the container must bind `0.0.0.0:19192`. The supplied image a
 
 ### Chromium reports that the profile is in use
 
-Only one browser process may own a profile directory. Stop the previous tunnel and verify its Chromium/Xvfb processes are gone before starting another process with the same `PROFILE_DIR`.
+Only one browser process may own a profile directory. In managed mode, stop the previous owner before starting another process with the same `PROFILE_DIR`. If another service should remain the browser/profile owner, use `BROWSER_MODE=cdp` and attach to its CDP endpoint instead of opening the profile again.
+
+### CDP mode does not find the intended tab
+
+Set `CDP_TARGET` to a distinctive URL or title substring. When the external browser has multiple tabs, the tunnel refuses to attach without a target. If the target matches no open tab, startup also fails closed.
 
 ### An internal callback or login host is blocked
 
@@ -299,7 +320,7 @@ Add the exact hostname to `ALLOWED_HOSTS`. Prefer a narrow allowlist entry over 
 
 ### The login session disappears after restart
 
-Confirm that every start uses the same `PROFILE_DIR` and that the directory is writable by the service user. In Docker, mount `/data/profile` as a persistent volume.
+In managed mode, confirm that every start uses the same `PROFILE_DIR` and that the directory is writable by the service user. In Docker, mount `/data/profile` as a persistent volume. In CDP mode, session persistence belongs to the external browser owner rather than this tunnel.
 
 ### The token is rejected
 

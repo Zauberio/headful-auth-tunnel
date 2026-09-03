@@ -15,8 +15,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlsplit
 
-from scrapling.fetchers import StealthySession
-
+from . import __version__
+from .browser import make_browser_backend
 from .config import Config
 from .security import NavigationPolicy, bearer_token, token_from_cookie
 from .ui import APP_CSS, APP_HTML, APP_JS, LOGIN_HTML
@@ -42,7 +42,7 @@ class BrowserSession:
     def __init__(self, config: Config):
         self.config = config
         self.policy = NavigationPolicy(config)
-        self.session = None
+        self.backend = None
         self.context = None
         self.page = None
         self.viewport = {"width": config.screen_width, "height": config.screen_height}
@@ -56,78 +56,72 @@ class BrowserSession:
         self._quarantining_pages: set[int] = set()
 
     def start(self) -> None:
-        decision = self.policy.validate(self.config.base_url, refresh=True)
-        if not decision.allowed:
-            raise RuntimeError(f"BASE_URL blocked: {decision.reason}")
+        decision = None
+        if self.config.browser_mode == "managed":
+            decision = self.policy.validate(self.config.base_url, refresh=True)
+            if not decision.allowed:
+                raise RuntimeError(f"BASE_URL blocked: {decision.reason}")
 
-        self.session = StealthySession(
-            headless=False,
-            user_data_dir=str(self.config.profile_dir),
-            executable_path=(
-                str(self.config.browser_executable_path)
-                if self.config.browser_executable_path
-                else None
-            ),
-            locale=self.config.locale,
-            timezone_id=self.config.timezone_id,
-            timeout=self.config.navigation_timeout_ms,
-            solve_cloudflare=False,
-            allow_webgl=True,
-            hide_canvas=False,
-            block_webrtc=True,
-            google_search=False,
-            network_idle=False,
-            load_dom=False,
-            max_pages=20,
-            additional_args={
-                "viewport": self.viewport.copy(),
-                "screen": self.viewport.copy(),
-                "device_scale_factor": 1,
-            },
+        self.backend = make_browser_backend(
+            self.config,
+            self._route_request,
+            self._route_websocket,
+            self._on_page,
         )
-        self.session.start()
-        self.context = self.session.context
-        self.context.route("**/*", self._route_request)
-        self.context.route_web_socket("**/*", self._route_websocket)
-        self.context.on("page", self._on_page)
+        handle = self.backend.start()
+        self.context = handle.context
+        self.page = handle.page
 
-        pages = [page for page in self.context.pages if not page.is_closed()]
-        self.page = pages[0] if pages else self.context.new_page()
-        # Attach browser-triggered landing guards to each existing page.
-        for p in pages:
-            self._attach_redirect_response_guard(p)
-            try:
-                p.on("framenavigated", self._on_frame_navigated)
-            except Exception:
-                LOGGER.exception("Failed to attach frame navigation handler to existing page")
-        self._attach_redirect_response_guard(self.page)
-        self.page.set_viewport_size(self.viewport)
-        self.page.goto(
-            decision.normalized_url or self.config.base_url,
-            wait_until="domcontentloaded",
-            timeout=self.config.navigation_timeout_ms,
-        )
-        # A 302 from BASE_URL to a denied host is followed internally by
-        # Chromium (never routed) - re-validate where we actually landed.
-        self._check_startup_final_url()
+        for page in self._pages():
+            self._attach_page_guards(page)
+
+        if self.config.browser_mode == "managed":
+            self.page.set_viewport_size(self.viewport)
+            self.page.goto(
+                decision.normalized_url or self.config.base_url,
+                wait_until="domcontentloaded",
+                timeout=self.config.navigation_timeout_ms,
+            )
+            # A 302 from BASE_URL to a denied host is followed internally by
+            # Chromium (never routed) - re-validate where we actually landed.
+            self._check_startup_final_url()
+            return
+
+        try:
+            dimensions = self.page.evaluate(
+                "() => ({width: window.innerWidth, height: window.innerHeight})"
+            )
+            width = int(dimensions.get("width", 0))
+            height = int(dimensions.get("height", 0))
+            if 320 <= width <= 7680 and 240 <= height <= 4320:
+                self.viewport = {"width": width, "height": height}
+        except Exception:
+            LOGGER.warning("Could not read attached CDP viewport; using configured dimensions")
+
+        try:
+            self._check_final_url(self.page)
+        except RequestError as exc:
+            self.close()
+            raise RuntimeError(f"Attached CDP tab blocked: {exc.message}") from exc
 
     def _check_startup_final_url(self) -> str:
         final_url = self._final_url(self.page)
         if not final_url:
-            self.session.close()
+            self.close()
             raise RuntimeError("BASE_URL final URL could not be determined")
         decision = self.policy.validate(final_url, refresh=True)
         if not decision.allowed:
-            self.session.close()
+            self.close()
             raise RuntimeError(f"BASE_URL redirected to blocked host: {decision.reason}")
         return decision.normalized_url or final_url
 
     def close(self) -> None:
-        if self.session is not None:
-            try:
-                self.session.close()
-            except Exception:
-                LOGGER.exception("Failed to close browser session")
+        if self.backend is not None:
+            self.backend.close()
+
+    def _attach_page_guards(self, page) -> None:
+        self._attach_redirect_response_guard(page)
+        page.on("framenavigated", self._on_frame_navigated)
 
     def _route_request(self, route, request) -> None:
         decision = self.policy.validate(request.url, allow_non_network=True)
@@ -222,14 +216,14 @@ class BrowserSession:
         # another tab.
         if page.is_closed():
             return
-        try:
-            page.set_viewport_size(self.viewport)
-        except Exception:
-            LOGGER.exception("Failed to size new page")
+        if self.config.browser_mode == "managed":
+            try:
+                page.set_viewport_size(self.viewport)
+            except Exception:
+                LOGGER.exception("Failed to size new page")
         # Cover browser-triggered redirects and navigations on every new page.
         try:
-            self._attach_redirect_response_guard(page)
-            page.on("framenavigated", self._on_frame_navigated)
+            self._attach_page_guards(page)
         except Exception:
             LOGGER.exception("Failed to attach browser landing guards")
             with contextlib.suppress(Exception):
@@ -313,6 +307,8 @@ class BrowserSession:
         self._quarantine_page(page, "Failed to quarantine frame-blocked page")
 
     def _pages(self) -> list[Any]:
+        if self.backend is not None:
+            return self.backend.pages()
         if self.context is None:
             return []
         return [page for page in self.context.pages if not page.is_closed()]
@@ -320,6 +316,8 @@ class BrowserSession:
     def _current_page(self):
         pages = self._pages()
         if not pages:
+            if self.config.browser_mode == "cdp":
+                raise RuntimeError("The attached CDP tab is no longer available")
             # The last tab was closed (API close_tab has a 409 guard, but a
             # human closing the tab or window.close() in page JS bypasses it).
             # Recover by opening a fresh page instead of bricking every
@@ -386,7 +384,9 @@ class BrowserSession:
             "timezone_id": self.config.timezone_id,
             "private_network_navigation": self.config.allow_private_network_navigation,
             "browser_mode": "headful",
-            "persistent_profile": True,
+            "browser_backend": self.config.browser_mode,
+            "browser_owner": "external" if self.config.browser_mode == "cdp" else "tunnel",
+            "persistent_profile": True if self.config.browser_mode == "managed" else None,
             "browser_instance_id": self.instance_id,
             "browser_started_at": self.started_at,
         }
@@ -789,7 +789,7 @@ class SessionStore:
 
 def make_handler(config: Config, controller: BrowserController, sessions: SessionStore):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "HeadfulAuthTunnel/0.4.0"
+        server_version = f"HeadfulAuthTunnel/{__version__}"
 
         def setup(self) -> None:
             super().setup()

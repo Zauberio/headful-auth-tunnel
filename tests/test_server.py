@@ -226,8 +226,32 @@ def test_browser_metadata_declares_headful_persistent_single_instance(make_confi
     second = session.meta()
 
     assert first["browser_mode"] == "headful"
+    assert first["browser_backend"] == "managed"
+    assert first["browser_owner"] == "tunnel"
     assert first["persistent_profile"] is True
     assert first["browser_instance_id"] == second["browser_instance_id"]
+
+
+def test_browser_metadata_declares_external_owner_for_cdp(make_config):
+    session = BrowserSession(
+        make_config(
+            browser_mode="cdp",
+            cdp_endpoint="http://127.0.0.1:9223",
+            cdp_target="example",
+            profile_dir=None,
+        )
+    )
+    page = SnapshotPage()
+    page.url = "https://example.com"
+    page.title = lambda: "Example"
+    session.context = SnapshotContext(page)
+    session.page = page
+
+    meta = session.meta()
+
+    assert meta["browser_backend"] == "cdp"
+    assert meta["browser_owner"] == "external"
+    assert meta["persistent_profile"] is None
 
 
 class LifecyclePage:
@@ -353,6 +377,29 @@ def test_current_page_recovers_zero_tabs_at_configured_base_url(make_config):
     ]
     assert recovered.url == "https://example.com/login"
     assert recovered.viewport == session.viewport
+
+
+def test_current_page_cdp_fails_closed_when_attached_tab_is_gone(make_config):
+    session = BrowserSession(
+        make_config(
+            browser_mode="cdp",
+            cdp_endpoint="http://127.0.0.1:9223",
+            cdp_target="example",
+            profile_dir=None,
+        )
+    )
+    closed = LifecyclePage(closed=True)
+    session.context = LifecycleContext([closed])
+    session.page = closed
+
+    class EmptyBackend:
+        def pages(self):
+            return []
+
+    session.backend = EmptyBackend()
+
+    with pytest.raises(RuntimeError, match="attached CDP tab"):
+        session._current_page()
 
 
 def test_current_page_uses_normalized_recovery_url(make_config):
@@ -543,12 +590,13 @@ def test_non_redirect_response_continues_without_dns_budget(make_config):
 def test_startup_final_url_unreadable_fails_closed(make_config):
     session = BrowserSession(make_config())
     session.page = _UnreadableUrlPage()
-    session.session = _ClosableSession()
+    backend = _ClosableSession()
+    session.backend = backend
 
     with pytest.raises(RuntimeError, match="could not be determined"):
         session._check_startup_final_url()
 
-    assert session.session.closed is True
+    assert backend.closed is True
 
 
 def test_subframe_landing_is_validated_and_quarantined(make_config):

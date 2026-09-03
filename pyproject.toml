@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "headful-auth-tunnel"
-version = "0.4.2"
+version = "0.4.3"
 description = "LAN/VPN remote-control tunnel for human-operated headful browser sessions with persistent profiles."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,7 +28,7 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
   "Topic :: Internet :: WWW/HTTP :: Browsers",
 ]
-dependencies = ["scrapling[fetchers]>=0.4.8,<0.5"]
+dependencies = ["playwright>=1.48,<2", "scrapling[fetchers]>=0.4.8,<0.5"]
 
 [project.optional-dependencies]
 dev = [

@@ -14,6 +14,9 @@ def make_config(tmp_path: Path):
             "bind_host": "127.0.0.1",
             "port": 6080,
             "base_url": "https://example.com",
+            "browser_mode": "managed",
+            "cdp_endpoint": None,
+            "cdp_target": None,
             "profile_dir": tmp_path / "profile",
             "browser_executable_path": None,
             "screen_width": 1440,
@@ -41,7 +44,8 @@ def make_config(tmp_path: Path):
             "max_dom_elements": 250,
         }
         values.update(overrides)
-        values["profile_dir"].mkdir(parents=True, exist_ok=True)
+        if values["profile_dir"] is not None:
+            values["profile_dir"].mkdir(parents=True, exist_ok=True)
         return Config(**values)
 
     return factory

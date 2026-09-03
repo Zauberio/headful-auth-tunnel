@@ -76,7 +76,10 @@ class Config:
     bind_host: str
     port: int
     base_url: str
-    profile_dir: Path
+    browser_mode: str
+    cdp_endpoint: str | None
+    cdp_target: str | None
+    profile_dir: Path | None
     browser_executable_path: Path | None
     screen_width: int
     screen_height: int
@@ -128,15 +131,29 @@ class Config:
         if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", cookie_name):
             raise ValueError("SESSION_COOKIE_NAME contains invalid characters")
 
-        profile_dir = Path(
-            os.getenv("PROFILE_DIR", Path.home() / ".headful-auth-tunnel" / "profile")
-        ).expanduser()
-        profile_dir.mkdir(parents=True, exist_ok=True)
+        browser_mode = os.getenv("BROWSER_MODE", "managed").strip().lower() or "managed"
+        if browser_mode not in {"managed", "cdp"}:
+            raise ValueError("BROWSER_MODE must be either managed or cdp")
+
+        cdp_endpoint = os.getenv("CDP_ENDPOINT", "").strip() or None
+        cdp_target = os.getenv("CDP_TARGET", "").strip() or None
+        if browser_mode == "cdp" and not cdp_endpoint:
+            raise ValueError("CDP_ENDPOINT is required when BROWSER_MODE=cdp")
+
+        profile_dir = None
+        if browser_mode == "managed":
+            profile_dir = Path(
+                os.getenv("PROFILE_DIR", Path.home() / ".headful-auth-tunnel" / "profile")
+            ).expanduser()
+            profile_dir.mkdir(parents=True, exist_ok=True)
 
         return cls(
             bind_host=os.getenv("BIND_HOST", "127.0.0.1"),
             port=_env_int("PORT", 19192, 1, 65535),
             base_url=os.getenv("BASE_URL", "https://example.com").strip(),
+            browser_mode=browser_mode,
+            cdp_endpoint=cdp_endpoint,
+            cdp_target=cdp_target,
             profile_dir=profile_dir,
             browser_executable_path=(
                 Path(os.environ["BROWSER_EXECUTABLE_PATH"]).expanduser()
