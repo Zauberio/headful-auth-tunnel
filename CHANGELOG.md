@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.4 - 2026-09-04
+
+### Browser safety and authentication
+
+- Raise the default DNS validation budget to 512 distinct network origins per 5-second window and make it configurable with `DNS_VALIDATION_MAX_EVENTS`.
+- Reuse a fresh DNS decision for repeated events from the same origin inside the budget window instead of consuming budget and forcing a lookup on every iframe/redirect/read-boundary event. Distinct origins remain fail-closed when the budget is exhausted.
+- Replace restart-local UI sessions with signed per-browser/device session cookies that survive tunnel restarts. The access token is never stored in the browser cookie.
+- Set browser-session lifetime to 30 days by default and make it configurable with `SESSION_TTL_SECONDS`. Rotating the master access token invalidates all outstanding browser sessions.
+- Rename the UI keyboard text button from `Type` to `Send`; the HTTP API remains `POST /type` for compatibility.
+
 ## 0.4.3 - 2026-09-03
 
 ### Browser ownership

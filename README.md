@@ -134,7 +134,7 @@ The default policy allows normal public `http` and `https` sites and blocks:
 - credentials embedded in URLs;
 - `file:` and unsupported schemes.
 
-DNS decisions are revalidated periodically and explicit top-level navigation forces a fresh lookup.
+DNS decisions are revalidated periodically and explicit top-level navigation forces a fresh lookup. Browser-triggered redirects/frame landings share a budget of 512 distinct network origins per 5-second window by default; repeated events for the same origin reuse the fresh decision within that window.
 
 Policy precedence is:
 
@@ -156,7 +156,7 @@ A specific allowlist entry is preferable to enabling every private destination.
 
 ### Browser UI
 
-The browser submits the access token once to `POST /session`. The server creates an independent random session ID and returns it as an `HttpOnly`, `SameSite=Strict` cookie. The access token itself is not placed in the cookie.
+The browser submits the access token once to `POST /session`. The server returns a signed per-browser/device session cookie containing only a random device identifier and expiry; the access token itself is not placed in the cookie. The cookie is `HttpOnly`, `SameSite=Strict`, survives tunnel restarts, and lasts 30 days by default. Rotating the access token invalidates all existing browser sessions.
 
 Legacy query-string bootstrap can be enabled temporarily:
 
@@ -181,7 +181,7 @@ The web UI is a live view of the complete headful browser. Login pages, password
 
 Browser ownership depends on the backend. In `managed` mode, one tunnel process owns one live Chromium context and reuses `PROFILE_DIR` across restarts. In `cdp` mode, Chromium and its profile remain owned by an external service; the tunnel attaches to one selected tab and never closes the external browser. In both modes, every HTTP/UI action is serialized through the same browser worker thread.
 
-The UI supports direct click/drag, navigation, typing, key presses, viewport changes, tab selection and selector-based editing.
+The UI supports direct click/drag, navigation, text sending, key presses, viewport changes, tab selection and selector-based editing. The visible text-entry button is labelled **Send**; API compatibility remains `POST /type`.
 
 Authenticated API operations include:
 
@@ -235,7 +235,9 @@ Sensitive values are omitted unless `include_sensitive_values` is explicitly ena
 | `ALLOWED_HOSTS` | empty | Comma-separated explicit allow patterns. |
 | `DENIED_HOSTS` | empty | Comma-separated explicit deny patterns. |
 | `ALLOW_QUERY_TOKEN` | `false` | Enable legacy `?token=` bootstrap. |
-| `SESSION_COOKIE_NAME` | `headful_auth_session` | Session cookie name. |
+| `SESSION_COOKIE_NAME` | `headful_auth_session` | Per-browser/device session cookie name. |
+| `SESSION_TTL_SECONDS` | `2592000` | Signed browser-session lifetime in seconds (30 days by default). |
+| `DNS_VALIDATION_MAX_EVENTS` | `512` | Maximum distinct network origins requiring fresh DNS validation per 5-second browser-landing window. Repeated events for the same origin reuse the fresh decision. |
 | `MAX_REQUEST_BYTES` | `1048576` | Maximum request body. |
 | `MAX_TYPE_TEXT_CHARS` | `16384` | Maximum text accepted by `/type`. |
 | `MAX_URL_CHARS` | `8192` | Maximum navigation URL length before parsing or DNS resolution. |

@@ -18,6 +18,8 @@ RELEVANT_ENV = {
     "LOCALE",
     "TIMEZONE_ID",
     "SESSION_COOKIE_NAME",
+    "SESSION_TTL_SECONDS",
+    "DNS_VALIDATION_MAX_EVENTS",
     "TLS_CERT",
     "TLS_KEY",
 }
@@ -43,6 +45,8 @@ def test_defaults_are_original_values(monkeypatch, tmp_path):
     assert config.max_url_chars == 8192
     assert config.allow_private_network_navigation is False
     assert config.allow_query_token is False
+    assert config.session_ttl_seconds == 2_592_000
+    assert config.dns_validation_max_events == 512
     assert token_file.read_text().strip() == config.auth_token
     if os.name != "nt":
         assert token_file.stat().st_mode & 0o777 == 0o600
@@ -112,3 +116,16 @@ def test_invalid_browser_mode_is_rejected(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="BROWSER_MODE"):
         Config.from_env()
+
+
+def test_persistent_session_and_dns_budget_are_configurable(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_FILE", str(tmp_path / "token"))
+    monkeypatch.setenv("PROFILE_DIR", str(tmp_path / "profile"))
+    monkeypatch.setenv("SESSION_TTL_SECONDS", "604800")
+    monkeypatch.setenv("DNS_VALIDATION_MAX_EVENTS", "1024")
+
+    config = Config.from_env()
+
+    assert config.session_ttl_seconds == 604800
+    assert config.dns_validation_max_events == 1024

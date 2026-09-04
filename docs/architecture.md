@@ -81,10 +81,10 @@ For the browser UI:
 
 1. the operator submits the token once to `POST /session`;
 2. the server verifies it with a constant-time comparison;
-3. the server creates a separate random session identifier;
-4. the browser receives that identifier in an `HttpOnly`, `SameSite=Strict` cookie.
+3. the server creates a random per-browser/device identifier plus an expiry and signs that payload with HMAC-SHA256 derived from the access token;
+4. the browser receives the signed value in an `HttpOnly`, `SameSite=Strict` cookie.
 
-The access token is not stored in JavaScript, routine URLs or the session cookie. API clients can use `Authorization: Bearer <token>`.
+The access token is not stored in JavaScript, routine URLs or the session cookie. Signed browser sessions survive tunnel restarts and default to a 30-day lifetime (`SESSION_TTL_SECONDS=2592000`). Rotating the access token invalidates all outstanding browser sessions because their signatures no longer verify. API clients can use `Authorization: Bearer <token>`.
 
 ## Destination policy
 
@@ -99,7 +99,7 @@ The policy is applied to:
 
 `DENIED_HOSTS` has highest precedence. `ALLOWED_HOSTS` can permit a required internal hostname. `ALLOW_PRIVATE_NETWORK_NAVIGATION=true` disables the private-network restriction globally.
 
-DNS results are cached briefly and explicit navigation forces a fresh lookup. This reduces DNS rebinding exposure while avoiding a lookup for every static asset.
+DNS results are cached briefly and explicit navigation forces a fresh lookup. Browser-triggered redirects, frame landings and read-boundary checks reserve fresh DNS validation by distinct network origin in a 5-second window. The default budget is 512 distinct origins; repeated events for an already validated origin reuse the fresh decision inside that window. This preserves periodic DNS-rebinding checks without letting legitimate iframe/redirect churn exhaust the global budget.
 
 ## Screenshots and coordinates
 

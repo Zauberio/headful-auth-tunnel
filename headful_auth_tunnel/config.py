@@ -39,9 +39,14 @@ def _env_csv(name: str) -> tuple[str, ...]:
     return tuple(item.strip().lower() for item in value.split(",") if item.strip())
 
 
+def _default_state_dir() -> Path:
+    return (
+        Path(os.getenv("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "headful-auth-tunnel"
+    )
+
+
 def _default_token_file() -> Path:
-    state_home = Path(os.getenv("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return state_home / "headful-auth-tunnel" / "token"
+    return _default_state_dir() / "token"
 
 
 def load_or_create_token() -> tuple[str, Path | None]:
@@ -94,6 +99,8 @@ class Config:
     auth_token: str
     token_file: Path | None
     session_cookie_name: str
+    session_ttl_seconds: int
+    dns_validation_max_events: int
     allow_query_token: bool
     allow_private_network_navigation: bool
     allowed_hosts: tuple[str, ...]
@@ -173,6 +180,8 @@ class Config:
             auth_token=token,
             token_file=token_file,
             session_cookie_name=cookie_name,
+            session_ttl_seconds=_env_int("SESSION_TTL_SECONDS", 2_592_000, 300, 31_536_000),
+            dns_validation_max_events=_env_int("DNS_VALIDATION_MAX_EVENTS", 512, 1, 100_000),
             allow_query_token=_env_bool("ALLOW_QUERY_TOKEN", False),
             allow_private_network_navigation=_env_bool("ALLOW_PRIVATE_NETWORK_NAVIGATION", False),
             allowed_hosts=_env_csv("ALLOWED_HOSTS"),

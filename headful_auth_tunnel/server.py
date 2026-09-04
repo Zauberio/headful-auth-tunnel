@@ -19,6 +19,7 @@ from . import __version__
 from .browser import make_browser_backend
 from .config import Config
 from .security import NavigationPolicy, bearer_token, token_from_cookie
+from .sessions import SessionStore
 from .ui import APP_CSS, APP_HTML, APP_JS, LOGIN_HTML
 
 LOGGER = logging.getLogger("headful_auth_tunnel")
@@ -50,8 +51,9 @@ class BrowserSession:
         self.started_at = time.time()
         self._frame_dns_window_started = time.monotonic()
         self._frame_dns_events = 0
+        self._frame_dns_origins: set[str] = set()
         self._frame_dns_window_seconds = 5.0
-        self._frame_dns_max_events = 32
+        self._frame_dns_max_events = config.dns_validation_max_events
         self._read_frame_limit = 64
         self._quarantining_pages: set[int] = set()
 
@@ -152,6 +154,7 @@ class BrowserSession:
         request_id = event.get("requestId")
         if not request_id:
             return
+
         try:
             status = int(event.get("responseStatusCode") or 0)
             if status in {301, 302, 303, 307, 308}:
@@ -163,29 +166,31 @@ class BrowserSession:
                 if location:
                     source = str(event.get("request", {}).get("url", ""))
                     target = urljoin(source, location)
-                    if not self._consume_frame_dns_budget():
+                    budget_allowed, refresh_dns = self._reserve_dns_refresh(target)
+                    if not budget_allowed:
                         LOGGER.warning(
                             "Blocked browser redirect to %s: DNS validation budget exceeded",
                             target,
                         )
-                        cdp.send(
-                            "Fetch.failRequest",
-                            {"requestId": request_id, "errorReason": "BlockedByClient"},
-                        )
+                        with contextlib.suppress(Exception):
+                            cdp.send(
+                                "Fetch.failRequest",
+                                {"requestId": request_id, "errorReason": "BlockedByClient"},
+                            )
                         return
-                    decision = self.policy.validate(target, refresh=True)
+                    decision = self.policy.validate(target, refresh=refresh_dns)
                     if not decision.allowed:
                         LOGGER.warning(
                             "Blocked browser redirect to %s: %s",
                             target,
                             decision.reason,
                         )
-                        cdp.send(
-                            "Fetch.failRequest",
-                            {"requestId": request_id, "errorReason": "BlockedByClient"},
-                        )
+                        with contextlib.suppress(Exception):
+                            cdp.send(
+                                "Fetch.failRequest",
+                                {"requestId": request_id, "errorReason": "BlockedByClient"},
+                            )
                         return
-            cdp.send("Fetch.continueResponse", {"requestId": request_id})
         except Exception:
             LOGGER.exception("Redirect response validation failed")
             with contextlib.suppress(Exception):
@@ -193,6 +198,20 @@ class BrowserSession:
                     "Fetch.failRequest",
                     {"requestId": request_id, "errorReason": "BlockedByClient"},
                 )
+            return
+
+        # Chromium can retire a Fetch interception between the paused event and
+        # this continuation call (observed on complex login redirects). That is
+        # a benign CDP lifecycle race after the destination has already passed
+        # policy validation; treating it as a policy failure would incorrectly
+        # fail the navigation and leave the tab at about:blank.
+        try:
+            cdp.send("Fetch.continueResponse", {"requestId": request_id})
+        except Exception as exc:
+            if "Invalid InterceptionId" in str(exc):
+                LOGGER.debug("Redirect interception already retired: %s", request_id)
+                return
+            LOGGER.warning("Failed to continue validated redirect response: %s", exc)
 
     def _route_websocket(self, websocket_route) -> None:
         decision = self.policy.validate_websocket(websocket_route.url)
@@ -232,15 +251,38 @@ class BrowserSession:
         if self.page is None or self.page.is_closed() or self.page not in self._pages():
             self.page = page
 
-    def _consume_frame_dns_budget(self) -> bool:
+    def _reserve_dns_refresh(self, url: str) -> tuple[bool, bool]:
+        """Reserve a fresh DNS validation for a distinct network origin.
+
+        Repeated events for the same origin inside the 5-second budget window reuse
+        the policy cache. This keeps DNS-rebinding checks periodic without allowing
+        iframe/redirect churn on a legitimate site to exhaust the global budget.
+        """
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"} or not parsed.hostname:
+            return True, False
+
+        try:
+            port = parsed.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            port = 0
+        origin = f"{scheme}://{parsed.hostname.rstrip('.').lower()}:{port}"
+
         now = time.monotonic()
         if now - self._frame_dns_window_started >= self._frame_dns_window_seconds:
             self._frame_dns_window_started = now
             self._frame_dns_events = 0
+            self._frame_dns_origins.clear()
+
+        if origin in self._frame_dns_origins:
+            return True, False
         if self._frame_dns_events >= self._frame_dns_max_events:
-            return False
+            return False, False
+
+        self._frame_dns_origins.add(origin)
         self._frame_dns_events += 1
-        return True
+        return True, True
 
     def _quarantine_page(self, page, log_message: str) -> None:
         key = id(page)
@@ -254,9 +296,10 @@ class BrowserSession:
         finally:
             self._quarantining_pages.discard(key)
 
-    def _consume_dns_or_block(self, page, reason: str) -> None:
-        if self._consume_frame_dns_budget():
-            return
+    def _dns_refresh_or_block(self, page, url: str, reason: str) -> bool:
+        allowed, refresh_dns = self._reserve_dns_refresh(url)
+        if allowed:
+            return refresh_dns
         LOGGER.warning("Blocked browser access: DNS validation budget exceeded")
         self._quarantine_page(page, "Failed to quarantine page after DNS budget exhaustion")
         raise RequestError(403, reason)
@@ -281,7 +324,8 @@ class BrowserSession:
             self._quarantine_page(page, "Failed to quarantine frame with unreadable URL")
             return
 
-        if not self._consume_frame_dns_budget():
+        budget_allowed, refresh_dns = self._reserve_dns_refresh(url)
+        if not budget_allowed:
             LOGGER.warning("Blocked frame navigation: DNS validation budget exceeded")
             self._quarantine_page(
                 page,
@@ -293,7 +337,7 @@ class BrowserSession:
             decision = self.policy.validate(
                 url,
                 allow_non_network=True,
-                refresh=True,
+                refresh=refresh_dns,
             )
         except Exception:
             LOGGER.exception("Frame navigation validation failed")
@@ -450,8 +494,10 @@ class BrowserSession:
         if not url:
             self._quarantine_page(page, "Failed to quarantine page with unreadable URL")
             raise RequestError(403, "Blocked: could not determine final URL")
-        self._consume_dns_or_block(page, "Blocked: DNS validation budget exceeded")
-        decision = self.policy.validate(url, allow_non_network=True, refresh=True)
+        refresh_dns = self._dns_refresh_or_block(
+            page, url, "Blocked: DNS validation budget exceeded"
+        )
+        decision = self.policy.validate(url, allow_non_network=True, refresh=refresh_dns)
         if not decision.allowed:
             self._quarantine_page(page, "Failed to quarantine blocked page")
             raise RequestError(403, f"Redirected to blocked host: {decision.reason}")
@@ -479,11 +525,13 @@ class BrowserSession:
                     "Failed to quarantine page with unreadable frame URL",
                 )
                 raise RequestError(403, "Blocked: could not determine frame URL")
-            self._consume_dns_or_block(page, "Blocked: DNS validation budget exceeded")
+            refresh_dns = self._dns_refresh_or_block(
+                page, frame_url, "Blocked: DNS validation budget exceeded"
+            )
             frame_decision = self.policy.validate(
                 frame_url,
                 allow_non_network=True,
-                refresh=True,
+                refresh=refresh_dns,
             )
             if not frame_decision.allowed:
                 self._quarantine_page(page, "Failed to quarantine page with blocked frame")
@@ -749,44 +797,6 @@ class BrowserController:
         self._thread.join(timeout=10)
 
 
-class SessionStore:
-    def __init__(self, ttl_seconds: int = 43200):
-        self.ttl_seconds = ttl_seconds
-        self._sessions: dict[str, float] = {}
-        self._lock = threading.Lock()
-
-    def create(self) -> str:
-        token = secrets.token_urlsafe(32)
-        now = time.time()
-        with self._lock:
-            self._purge(now)
-            if len(self._sessions) >= 128:
-                oldest = min(self._sessions, key=self._sessions.get)
-                self._sessions.pop(oldest, None)
-            self._sessions[token] = now + self.ttl_seconds
-        return token
-
-    def valid(self, token: str | None) -> bool:
-        if not token:
-            return False
-        now = time.time()
-        with self._lock:
-            self._purge(now)
-            expires = self._sessions.get(token)
-            return expires is not None and expires > now
-
-    def revoke(self, token: str | None) -> None:
-        if not token:
-            return
-        with self._lock:
-            self._sessions.pop(token, None)
-
-    def _purge(self, now: float) -> None:
-        expired = [token for token, expires in self._sessions.items() if expires <= now]
-        for token in expired:
-            self._sessions.pop(token, None)
-
-
 def make_handler(config: Config, controller: BrowserController, sessions: SessionStore):
     class Handler(BaseHTTPRequestHandler):
         server_version = f"HeadfulAuthTunnel/{__version__}"
@@ -905,7 +915,7 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             if clear:
                 parts.extend(["Max-Age=0", "Expires=Thu, 01 Jan 1970 00:00:00 GMT"])
             else:
-                parts.append("Max-Age=43200")
+                parts.append(f"Max-Age={config.session_ttl_seconds}")
             forwarded_https = (
                 config.trust_forwarded_proto
                 and self.headers.get("X-Forwarded-Proto", "").strip().lower() == "https"
@@ -1120,7 +1130,7 @@ def main() -> None:
 
     controller = BrowserController(config)
     controller.start()
-    sessions = SessionStore()
+    sessions = SessionStore(config.auth_token, config.session_ttl_seconds)
     server = TunnelHTTPServer(
         (config.bind_host, config.port),
         make_handler(config, controller, sessions),

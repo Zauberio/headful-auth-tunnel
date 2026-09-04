@@ -2,7 +2,7 @@
 
 ## Authentication
 
-Browser sessions use the cookie returned by `POST /session`. Programmatic clients may send:
+Browser sessions use the signed per-browser/device cookie returned by `POST /session`. The cookie survives tunnel restarts and lasts 30 days by default (`SESSION_TTL_SECONDS=2592000`). Rotating the master access token invalidates outstanding browser sessions. Programmatic clients may send:
 
 ```http
 Authorization: Bearer <access-token>
@@ -39,11 +39,11 @@ Accepts form data or JSON:
 {"token":"access-token"}
 ```
 
-Returns `303 See Other` and sets the session cookie.
+Returns `303 See Other` and sets the signed `HttpOnly`, `SameSite=Strict` per-browser/device session cookie. The access token itself is not stored in the cookie.
 
 ### `POST /logout`
 
-Revokes the current session cookie and redirects to `/`.
+Clears the current browser session cookie and redirects to `/`. Rotating the master access token is the global revocation mechanism for all outstanding signed browser sessions.
 
 ## State and screenshots
 

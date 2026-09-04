@@ -40,7 +40,11 @@ class FakeController:
 def start_server(config):
     server = TunnelHTTPServer(
         ("127.0.0.1", 0),
-        make_handler(config, FakeController(), SessionStore()),
+        make_handler(
+            config,
+            FakeController(),
+            SessionStore(config.auth_token, config.session_ttl_seconds),
+        ),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -78,6 +82,7 @@ def test_login_uses_http_only_cookie_and_no_query_token(make_config):
         cookie = headers["Set-Cookie"]
         assert "HttpOnly" in cookie
         assert "SameSite=Strict" in cookie
+        assert f"Max-Age={config.session_ttl_seconds}" in cookie
         assert config.auth_token not in cookie
 
         cookie_pair = cookie.split(";", 1)[0]
@@ -159,12 +164,36 @@ def test_body_limit_returns_413(make_config):
         thread.join(timeout=5)
 
 
-def test_session_store_expiry():
-    store = SessionStore(ttl_seconds=1)
+def test_session_store_expiry(monkeypatch):
+    now = int(time.time())
+    monkeypatch.setattr(time, "time", lambda: now)
+    store = SessionStore("a" * 32, ttl_seconds=1)
     token = store.create()
     assert store.valid(token)
-    store._sessions[token] = time.time() - 1
+
+    monkeypatch.setattr(time, "time", lambda: now + 2)
     assert not store.valid(token)
+
+
+def test_session_survives_server_restart_for_same_browser():
+    auth_token = "master-token-" + "a" * 24
+    first = SessionStore(auth_token, ttl_seconds=3600)
+    browser_cookie = first.create()
+
+    restarted = SessionStore(auth_token, ttl_seconds=3600)
+    assert restarted.valid(browser_cookie) is True
+    assert auth_token not in browser_cookie
+
+
+def test_rotating_master_token_invalidates_persisted_browser_session():
+    browser_cookie = SessionStore("a" * 32).create()
+    assert SessionStore("b" * 32).valid(browser_cookie) is False
+
+
+def test_tampered_browser_session_is_rejected():
+    browser_cookie = SessionStore("a" * 32).create()
+    tampered = browser_cookie[:-1] + ("0" if browser_cookie[-1] != "0" else "1")
+    assert SessionStore("a" * 32).valid(tampered) is False
 
 
 def test_viewport_bounds_follow_runtime_resolution(make_config):
@@ -574,6 +603,26 @@ def test_redirect_response_continues_allowed_target(make_config):
     assert cdp.commands == [("Fetch.continueResponse", {"requestId": "request-1"})]
 
 
+class _StaleInterceptionCDP(_CDP):
+    def send(self, method, params):
+        self.commands.append((method, params))
+        if method == "Fetch.continueResponse":
+            raise RuntimeError("Protocol error (Fetch.continueResponse): Invalid InterceptionId.")
+
+
+def test_stale_redirect_interception_does_not_fail_allowed_navigation(make_config):
+    session = BrowserSession(make_config(allow_private_network_navigation=True))
+    cdp = _StaleInterceptionCDP()
+
+    session._on_redirect_response_paused(
+        cdp,
+        _redirect_event("http://127.0.0.1:9999/next"),
+    )
+
+    assert cdp.commands == [("Fetch.continueResponse", {"requestId": "request-1"})]
+    assert not any(method == "Fetch.failRequest" for method, _ in cdp.commands)
+
+
 def test_non_redirect_response_continues_without_dns_budget(make_config):
     session = BrowserSession(make_config(allow_private_network_navigation=True))
     session._frame_dns_max_events = 0
@@ -626,7 +675,7 @@ def test_unreadable_frame_url_is_quarantined(make_config):
     assert page.goto_calls == ["about:blank"]
 
 
-def test_frame_landing_forces_fresh_dns_every_time(make_config):
+def test_frame_landing_reuses_dns_within_budget_window(make_config):
     session = BrowserSession(make_config())
     page = FakePage(url="https://ok.test/")
     frame = _Frame(page, "https://same.test/frame")
@@ -641,7 +690,7 @@ def test_frame_landing_forces_fresh_dns_every_time(make_config):
     session._on_frame_navigated(frame)
     session._on_frame_navigated(frame)
 
-    assert refreshes == [True, True]
+    assert refreshes == [True, False]
 
 
 def test_read_boundary_rejects_blocked_subframe(make_config):
@@ -661,11 +710,10 @@ def test_read_boundary_rejects_blocked_subframe(make_config):
     assert page.goto_calls == ["about:blank"]
 
 
-def test_frame_dns_budget_fails_closed(make_config):
+def test_frame_dns_budget_fails_closed_on_distinct_origins(make_config):
     session = BrowserSession(make_config())
     session._frame_dns_max_events = 2
     page = FakePage(url="https://ok.test/")
-    frame = _Frame(page, "https://same.test/frame")
     calls = []
 
     class Policy:
@@ -674,12 +722,35 @@ def test_frame_dns_budget_fails_closed(make_config):
             return NavigationDecision(True, "ok", url)
 
     session.policy = Policy()
-    session._on_frame_navigated(frame)
-    session._on_frame_navigated(frame)
-    session._on_frame_navigated(frame)
+    session._on_frame_navigated(_Frame(page, "https://one.test/frame"))
+    session._on_frame_navigated(_Frame(page, "https://two.test/frame"))
+    session._on_frame_navigated(_Frame(page, "https://three.test/frame"))
 
-    assert len(calls) == 2
+    assert calls == [
+        ("https://one.test/frame", True),
+        ("https://two.test/frame", True),
+    ]
     assert page.goto_calls == ["about:blank"]
+
+
+def test_repeated_origin_does_not_exhaust_dns_budget(make_config):
+    session = BrowserSession(make_config())
+    session._frame_dns_max_events = 1
+    page = FakePage(url="https://ok.test/")
+    refreshes = []
+
+    class Policy:
+        def validate(self, url, *, allow_non_network=False, refresh=False):
+            refreshes.append(refresh)
+            return NavigationDecision(True, "ok", url)
+
+    session.policy = Policy()
+    for _ in range(1000):
+        session._on_frame_navigated(_Frame(page, "https://same.test/frame"))
+
+    assert refreshes[0] is True
+    assert all(refresh is False for refresh in refreshes[1:])
+    assert page.goto_calls == []
 
 
 def test_click_checks_landing_before_browser_action(make_config):

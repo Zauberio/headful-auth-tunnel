@@ -55,7 +55,7 @@ APP_HTML = """<!doctype html>
       </div>
       <div class="row">
         <input id="text" class="grow" type="text" placeholder="Text to type into the focused field">
-        <button id="type">Type</button>
+        <button id="type">Send</button>
         <input id="key" class="medium" type="text" placeholder="Key, e.g. Enter">
         <button id="press" class="secondary">Press</button>
         <button id="refresh" class="secondary">Refresh image</button>

@@ -20,3 +20,10 @@ def test_package_and_server_versions_match_pyproject():
 
     assert __version__ == expected
     assert handler.server_version == f"HeadfulAuthTunnel/{expected}"
+
+
+def test_ui_labels_text_entry_button_send():
+    from headful_auth_tunnel.ui import APP_HTML
+
+    assert '<button id="type">Send</button>' in APP_HTML
+    assert '<button id="type">Type</button>' not in APP_HTML
