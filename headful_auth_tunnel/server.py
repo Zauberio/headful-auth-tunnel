@@ -6,6 +6,7 @@ import logging
 import queue
 import re
 import secrets
+import signal
 import ssl
 import threading
 import time
@@ -832,10 +833,15 @@ class BrowserController:
         self._thread = threading.Thread(target=self._run, name="browser-worker", daemon=True)
         self._startup_error: BaseException | None = None
 
-    def start(self) -> None:
+    def start(self, stop_event: threading.Event | None = None) -> None:
         self._thread.start()
-        if not self._ready.wait(timeout=90):
-            raise RuntimeError("Browser worker did not become ready")
+        deadline = time.monotonic() + 90
+        while not self._ready.is_set():
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("Browser startup interrupted by shutdown signal")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Browser worker did not become ready")
+            self._ready.wait(timeout=0.5)
         if self._startup_error is not None:
             raise RuntimeError("Browser worker failed to start") from self._startup_error
 
@@ -1285,14 +1291,44 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(f"Configuration error: {exc}") from exc
 
+    # Install shutdown signal handlers BEFORE the browser starts so a
+    # SIGTERM/SIGINT arriving during the (slow) browser startup follows the
+    # same graceful path as one arriving while serving, instead of the
+    # default process termination. While the server does not exist yet a
+    # signal only sets stop_event, which the startup wait polls.
+    stop_event = threading.Event()
+    server_ref: list[TunnelHTTPServer | None] = [None]
+
+    def _handle_signal(signum, _frame):
+        LOGGER.info("Received signal %s; initiating graceful shutdown", signum)
+        stop_event.set()
+        server = server_ref[0]
+        if server is not None:
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     controller = BrowserController(config)
-    controller.start()
+    try:
+        controller.start(stop_event)
+    except RuntimeError:
+        if stop_event.is_set():
+            LOGGER.info("Shutdown requested during browser startup; cleaning up")
+            controller.close()
+            return
+        raise
+    if stop_event.is_set():
+        controller.close()
+        return
+
     sessions = SessionStore(config.auth_token, config.session_ttl_seconds)
     server = TunnelHTTPServer(
         (config.bind_host, config.port),
         make_handler(config, controller, sessions),
         max_concurrent_connections=config.max_concurrent_connections,
     )
+    server_ref[0] = server
 
     if config.tls_enabled:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1311,6 +1347,13 @@ def main() -> None:
         LOGGER.info("Authentication token file: %s", config.token_file)
     else:
         LOGGER.info("Authentication token supplied through AUTH_TOKEN")
+
+    # A signal may have arrived while the server was being created; honor it
+    # instead of starting serve_forever.
+    if stop_event.is_set():
+        server.server_close()
+        controller.close()
+        return
 
     try:
         server.serve_forever(poll_interval=0.5)
