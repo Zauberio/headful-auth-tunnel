@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.6 - 2026-09-05
+
+### Readiness and HTTP admission hardening
+
+- Make `scripts/start.sh` verify both the spawned PID and a fresh per-start `/health` nonce so an old or foreign process already bound to the port cannot produce a false successful start.
+- Add optional `TLS_CA_FILE` support for validating the helper script's local HTTPS readiness probe while preserving nonce-based process identity.
+- Add configurable `MAX_CONCURRENT_CONNECTIONS` (default 64) and reject excess sockets before creating handler threads.
+- Harden request logging and request-target parsing so malformed pre-auth traffic cannot trigger secondary exceptions or inject control characters into logs.
+- Reject unsupported `Transfer-Encoding`, detect truncated request bodies, and force connection close after request/body errors.
+
 ## 0.4.5 - 2026-09-05
 
 ### Login iframe stability

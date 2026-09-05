@@ -57,6 +57,8 @@ Returns:
 
 With `EXPOSE_HEALTH_DETAILS=true`, browser and tab counts are included.
 
+When the service is launched through `scripts/start.sh`, the launcher injects an ephemeral per-start readiness nonce. In that case `/health` also includes `"readiness_nonce":"..."`; the helper accepts startup only when the spawned PID remains alive and the exact nonce is echoed. The field is absent for normal/manual launches and is not an authentication credential.
+
 ### `GET /meta`
 
 Returns the active URL/title, viewport, locale, timezone, browser presentation mode, backend/owner metadata, persistent-profile flag and tunnel browser-session identifier. `browser_backend` is `managed` or `cdp`; `browser_owner` is `tunnel` or `external`. In CDP mode `persistent_profile` is `null` because profile persistence belongs to the external owner.

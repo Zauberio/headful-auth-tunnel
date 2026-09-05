@@ -10,6 +10,7 @@ remote browser or API client
         | HTTP(S), session cookie or bearer token
         v
 ThreadingHTTPServer
+  connection admission cap
         |
         | bounded command queue
         v
@@ -66,6 +67,14 @@ In managed mode, `PROFILE_DIR` contains cookies, local storage, IndexedDB, servi
 In CDP mode, profile location and persistence are external concerns. `PROFILE_DIR` is ignored and never opened by the tunnel.
 
 Treat any persistent browser profile as credential material. Never commit it, copy it into a container image, or expose it through the HTTP API.
+
+## HTTP admission and readiness identity
+
+The HTTP listener uses `ThreadingHTTPServer`, but admission is bounded before a handler thread is created. `MAX_CONCURRENT_CONNECTIONS` defaults to 64; when all slots are occupied, newly accepted sockets are closed immediately instead of spawning unbounded handler threads. Slot accounting is released when each handler thread exits, including exception paths. Per-client `SOCKET_TIMEOUT_SECONDS` remains a second bound against slow/incomplete clients.
+
+Request logging is defensive even when the HTTP parser has not populated `command` or `path`, and attacker-controlled control characters are sanitized before logging. Malformed request targets return `400` without causing a secondary logging/parsing exception. Unsupported `Transfer-Encoding`, invalid/oversized `Content-Length`, truncated bodies and other request/body errors close the connection so unread framing bytes cannot be reused as another request if HTTP persistence changes in the future.
+
+The local `scripts/start.sh` launcher also proves process identity, not just port reachability. It generates a cryptographically random per-start nonce, passes it to the child, and declares readiness only when the child PID is alive and `/health` echoes the same nonce. A stale tunnel or unrelated service already occupying the configured port therefore cannot satisfy readiness. The nonce is ephemeral, launcher-internal state and is not used for authentication.
 
 ## Command serialization
 

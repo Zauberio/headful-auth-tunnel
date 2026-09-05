@@ -20,6 +20,8 @@ RELEVANT_ENV = {
     "SESSION_COOKIE_NAME",
     "SESSION_TTL_SECONDS",
     "DNS_VALIDATION_MAX_EVENTS",
+    "HEADFUL_READINESS_NONCE",
+    "MAX_CONCURRENT_CONNECTIONS",
     "TLS_CERT",
     "TLS_KEY",
 }
@@ -47,6 +49,8 @@ def test_defaults_are_original_values(monkeypatch, tmp_path):
     assert config.allow_query_token is False
     assert config.session_ttl_seconds == 2_592_000
     assert config.dns_validation_max_events == 512
+    assert config.readiness_nonce is None
+    assert config.max_concurrent_connections == 64
     assert token_file.read_text().strip() == config.auth_token
     if os.name != "nt":
         assert token_file.stat().st_mode & 0o777 == 0o600
@@ -129,3 +133,27 @@ def test_persistent_session_and_dns_budget_are_configurable(monkeypatch, tmp_pat
 
     assert config.session_ttl_seconds == 604800
     assert config.dns_validation_max_events == 1024
+
+
+def test_readiness_nonce_and_connection_cap_are_configurable(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_FILE", str(tmp_path / "token"))
+    monkeypatch.setenv("PROFILE_DIR", str(tmp_path / "profile"))
+    monkeypatch.setenv("HEADFUL_READINESS_NONCE", "launch-123")
+    monkeypatch.setenv("MAX_CONCURRENT_CONNECTIONS", "7")
+
+    config = Config.from_env()
+
+    assert config.readiness_nonce == "launch-123"
+    assert config.max_concurrent_connections == 7
+
+
+@pytest.mark.parametrize("value", ["0", "1025", "not-an-int"])
+def test_invalid_connection_cap_is_rejected(monkeypatch, tmp_path, value):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TOKEN_FILE", str(tmp_path / "token"))
+    monkeypatch.setenv("PROFILE_DIR", str(tmp_path / "profile"))
+    monkeypatch.setenv("MAX_CONCURRENT_CONNECTIONS", value)
+
+    with pytest.raises(ValueError, match="MAX_CONCURRENT_CONNECTIONS"):
+        Config.from_env()

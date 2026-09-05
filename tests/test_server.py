@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 import threading
 import time
 import types
@@ -45,6 +46,7 @@ def start_server(config):
             FakeController(),
             SessionStore(config.auth_token, config.session_ttl_seconds),
         ),
+        max_concurrent_connections=config.max_concurrent_connections,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -59,6 +61,127 @@ def request(server, method, path, body=None, headers=None):
     result_headers = dict(response.getheaders())
     connection.close()
     return response.status, result_headers, payload
+
+
+def wait_until(predicate, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
+
+
+def raw_request(server, payload: bytes) -> bytes:
+    sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=2)
+    try:
+        sock.sendall(payload)
+        sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        sock.close()
+
+
+def test_health_shape_is_unchanged_without_readiness_nonce(make_config):
+    server, thread = start_server(make_config())
+    try:
+        status, _, payload = request(server, "GET", "/health")
+        assert status == 200
+        assert json.loads(payload) == {"status": "ok"}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_health_echoes_per_start_readiness_nonce(make_config):
+    server, thread = start_server(make_config(readiness_nonce="nonce-abc"))
+    try:
+        status, _, payload = request(server, "GET", "/health")
+        assert status == 200
+        assert json.loads(payload) == {"status": "ok", "readiness_nonce": "nonce-abc"}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_connection_cap_rejects_excess_connection_and_releases_slot(make_config):
+    config = make_config(max_concurrent_connections=1, socket_timeout_seconds=2)
+    server, thread = start_server(config)
+    first = socket.create_connection(("127.0.0.1", server.server_port), timeout=2)
+    try:
+        first.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n")
+        assert wait_until(lambda: server.active_connections == 1)
+
+        second = socket.create_connection(("127.0.0.1", server.server_port), timeout=2)
+        second.settimeout(1)
+        try:
+            second.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            try:
+                received = second.recv(1)
+            except ConnectionResetError:
+                received = b""
+            assert received == b""
+        finally:
+            second.close()
+
+        assert server.active_connections == 1
+    finally:
+        first.close()
+        assert wait_until(lambda: server.active_connections == 0)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_malformed_absolute_request_target_returns_400_and_server_survives(make_config):
+    server, thread = start_server(make_config())
+    try:
+        response = raw_request(
+            server,
+            b"GET http://[::1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        assert b" 400 " in response.split(b"\r\n", 1)[0]
+
+        status, _, payload = request(server, "GET", "/health")
+        assert status == 200
+        assert json.loads(payload) == {"status": "ok"}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_transfer_encoding_is_rejected_and_connection_closes(make_config):
+    config = make_config()
+    server, thread = start_server(config)
+    try:
+        response = raw_request(
+            server,
+            (
+                b"POST /navigate HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                + f"Authorization: Bearer {config.auth_token}\r\n".encode()
+                + b"Transfer-Encoding: chunked\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Connection: keep-alive\r\n\r\n"
+                b"4\r\ntest\r\n0\r\n\r\n"
+            ),
+        )
+        assert b" 400 " in response.split(b"\r\n", 1)[0]
+        assert b"Transfer-Encoding is not supported" in response
+        assert response.count(b"HTTP/") == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_login_uses_http_only_cookie_and_no_query_token(make_config):

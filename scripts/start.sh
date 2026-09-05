@@ -69,6 +69,14 @@ else
   set -- python3 -m headful_auth_tunnel.server
 fi
 
+if [ -x "$ROOT_DIR/.venv/bin/python" ]; then
+  readiness_nonce=$("$ROOT_DIR/.venv/bin/python" -c 'import secrets; print(secrets.token_hex(16))')
+else
+  readiness_nonce=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+fi
+HEADFUL_READINESS_NONCE=$readiness_nonce
+export HEADFUL_READINESS_NONCE
+
 cd "$ROOT_DIR"
 nohup "$@" >"$LOG_FILE" 2>&1 &
 pid=$!
@@ -82,9 +90,16 @@ while [ "$i" -lt 60 ]; do
   if ! kill -0 "$pid" 2>/dev/null; then
     break
   fi
-  if command -v curl >/dev/null 2>&1 && curl -kfsS --max-time 2 "$scheme://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
-    ready=1
-    break
+  if command -v curl >/dev/null 2>&1; then
+    if [ "$scheme" = https ] && [ -n "${TLS_CA_FILE:-}" ] && [ -f "$TLS_CA_FILE" ]; then
+      health=$(curl -fsS --max-time 2 --cacert "$TLS_CA_FILE" "$scheme://127.0.0.1:$PORT/health" 2>/dev/null || true)
+    else
+      health=$(curl -kfsS --max-time 2 "$scheme://127.0.0.1:$PORT/health" 2>/dev/null || true)
+    fi
+    if kill -0 "$pid" 2>/dev/null && printf '%s' "$health" | grep -Fq "\"readiness_nonce\":\"$readiness_nonce\""; then
+      ready=1
+      break
+    fi
   fi
   sleep 0.5
   i=$((i + 1))

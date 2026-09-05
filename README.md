@@ -243,11 +243,13 @@ Sensitive values are omitted unless `include_sensitive_values` is explicitly ena
 | `MAX_TYPE_TEXT_CHARS` | `16384` | Maximum text accepted by `/type`. |
 | `MAX_URL_CHARS` | `8192` | Maximum navigation URL length before parsing or DNS resolution. |
 | `SOCKET_TIMEOUT_SECONDS` | `15` | Per-client socket timeout. |
+| `MAX_CONCURRENT_CONNECTIONS` | `64` | Maximum concurrent HTTP client connections/handler threads; excess connections are closed before a handler thread is created. |
 | `EXPOSE_HEALTH_DETAILS` | `false` | Include browser/tab counts in `/health`. |
 | `TRUST_FORWARDED_PROTO` | `false` | Trust `X-Forwarded-Proto: https` from a controlled reverse proxy when deciding whether session cookies should be `Secure`. |
 | `MAX_DOM_TEXT_CHARS` | `20000` | Maximum page text returned by DOM snapshot. |
 | `MAX_DOM_ELEMENTS` | `250` | Maximum controls/links returned by DOM snapshot. |
 | `TLS_CERT`, `TLS_KEY` | unset | Enable TLS when both paths are configured. |
+| `TLS_CA_FILE` | unset | Optional CA file used by `scripts/start.sh` when validating the local HTTPS readiness probe; it is not used by the server itself. |
 
 ## TLS
 
@@ -259,6 +261,8 @@ TLS_KEY=/absolute/path/tunnel.key
 ```
 
 The server refuses partial TLS configuration. With TLS enabled, session cookies receive the `Secure` flag and responses include HSTS.
+
+The local `scripts/start.sh` launcher generates a fresh per-start readiness nonce and accepts startup only when the child PID is still alive and `/health` echoes that exact nonce. This prevents an old/foreign process already bound to the port from producing a false successful start. With HTTPS, `TLS_CA_FILE` can provide a CA for the local readiness probe; otherwise the helper intentionally permits the local/self-signed TLS handshake but still requires the nonce identity check.
 
 For any network beyond a trusted host, use a trusted reverse proxy or a certificate trusted by the client.
 

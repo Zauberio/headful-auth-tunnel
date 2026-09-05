@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import queue
+import re
 import secrets
 import ssl
 import threading
@@ -24,12 +25,28 @@ from .ui import APP_CSS, APP_HTML, APP_JS, LOGIN_HTML
 
 LOGGER = logging.getLogger("headful_auth_tunnel")
 
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _sanitize_log_text(value: object, *, limit: int = 2048) -> str:
+    text = value if isinstance(value, str) else repr(value)
+    return _CONTROL_CHARS.sub("?", text)[:limit]
+
 
 class RequestError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+def _split_request_target(raw_target: object):
+    if not isinstance(raw_target, str) or not raw_target or _CONTROL_CHARS.search(raw_target):
+        raise RequestError(400, "Malformed request target")
+    try:
+        return urlsplit(raw_target)
+    except ValueError as exc:
+        raise RequestError(400, "Malformed request target") from exc
 
 
 @dataclass
@@ -869,8 +886,21 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             self.connection.settimeout(config.socket_timeout_seconds)
 
         def log_message(self, fmt: str, *args) -> None:
-            path = urlsplit(self.path).path
-            LOGGER.info("%s %s %s", self.client_address[0], self.command, path)
+            raw_target = getattr(self, "path", "-")
+            command = _sanitize_log_text(getattr(self, "command", "-"), limit=64)
+            try:
+                path = _sanitize_log_text(urlsplit(raw_target).path)
+            except (TypeError, ValueError):
+                path = _sanitize_log_text(raw_target)
+            LOGGER.info("%s %s %s", self.client_address[0], command, path)
+
+        def _request_target(self):
+            raw_target = getattr(self, "path", "")
+            try:
+                return _split_request_target(raw_target)
+            except RequestError:
+                LOGGER.warning("Malformed request target: %s", _sanitize_log_text(raw_target))
+                raise
 
         def _headers(
             self,
@@ -930,6 +960,8 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             self._send_bytes(303, b"", "text/plain; charset=utf-8", headers)
 
         def _read_body(self) -> bytes:
+            if self.headers.get("Transfer-Encoding"):
+                raise RequestError(400, "Transfer-Encoding is not supported")
             raw_length = self.headers.get("Content-Length", "0")
             try:
                 length = int(raw_length)
@@ -939,7 +971,10 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                 raise RequestError(400, "Invalid Content-Length")
             if length > config.max_request_bytes:
                 raise RequestError(413, "Request body is too large")
-            return self.rfile.read(length)
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise RequestError(400, "Incomplete request body")
+            return raw
 
         def _json_body(self) -> dict[str, Any]:
             raw = self._read_body()
@@ -988,6 +1023,7 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             return "; ".join(parts)
 
         def _handle_error(self, exc: BaseException) -> None:
+            self.close_connection = True
             if isinstance(exc, RequestError):
                 self._send_json(exc.status, {"error": exc.message})
                 return
@@ -1004,7 +1040,7 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                 self._handle_error(exc)
 
         def _do_GET(self) -> None:
-            parsed = urlsplit(self.path)
+            parsed = self._request_target()
             path = parsed.path
 
             if path == "/health":
@@ -1014,6 +1050,8 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                     health = {"status": "degraded", "browser": False}
                 if not config.expose_health_details:
                     health = {"status": health["status"]}
+                if config.readiness_nonce:
+                    health["readiness_nonce"] = config.readiness_nonce
                 self._send_json(200 if health["status"] == "ok" else 503, health)
                 return
 
@@ -1065,7 +1103,7 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                 self._handle_error(exc)
 
         def _do_POST(self) -> None:
-            path = urlsplit(self.path).path
+            path = self._request_target().path
 
             if path == "/session":
                 raw = self._read_body()
@@ -1200,6 +1238,42 @@ class TunnelHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(self, *args, max_concurrent_connections: int = 64, **kwargs):
+        if max_concurrent_connections < 1:
+            raise ValueError("max_concurrent_connections must be at least 1")
+        self._connection_slots = threading.BoundedSemaphore(max_concurrent_connections)
+        self._connection_count_lock = threading.Lock()
+        self._active_connections = 0
+        super().__init__(*args, **kwargs)
+
+    @property
+    def active_connections(self) -> int:
+        with self._connection_count_lock:
+            return self._active_connections
+
+    def _release_connection_slot(self) -> None:
+        with self._connection_count_lock:
+            self._active_connections -= 1
+        self._connection_slots.release()
+
+    def process_request(self, request, client_address):
+        if not self._connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        with self._connection_count_lock:
+            self._active_connections += 1
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._release_connection_slot()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release_connection_slot()
+
 
 def main() -> None:
     logging.basicConfig(
@@ -1217,6 +1291,7 @@ def main() -> None:
     server = TunnelHTTPServer(
         (config.bind_host, config.port),
         make_handler(config, controller, sessions),
+        max_concurrent_connections=config.max_concurrent_connections,
     )
 
     if config.tls_enabled:
