@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.5 - 2026-09-05
+
+### Login iframe stability
+
+- Ignore transient subframes that have not committed a URL yet instead of quarantining the entire page. Empty/unreadable main-frame URLs remain fail-closed.
+- Log every page quarantine with the current page URL and the reason before navigating to `about:blank`, making screenshot/read-boundary failures diagnosable.
+- Add an explicit **Drag: Off/On** UI mode: normal clicks use the stable `/click` path by default, while Drag mode uses continuous pointer down/move/up events for human-operated sliders and similar controls.
+- Keep the normal screenshot refresh interval at the configured/default 2 seconds in both click and drag modes.
+
 ## 0.4.4 - 2026-09-04
 
 ### Browser safety and authentication

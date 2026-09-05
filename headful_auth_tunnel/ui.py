@@ -59,6 +59,7 @@ APP_HTML = """<!doctype html>
         <input id="key" class="medium" type="text" placeholder="Key, e.g. Enter">
         <button id="press" class="secondary">Press</button>
         <button id="refresh" class="secondary">Refresh image</button>
+        <button id="dragMode" class="secondary" aria-pressed="false">Drag: Off</button>
       </div>
     </section>
 
@@ -136,6 +137,10 @@ APP_JS = r"""
 const $ = (id) => document.getElementById(id);
 let refreshTimer = null;
 let dragStart = null;
+let dragMode = false;
+let activeDrag = false;
+let pointerMoveBusy = false;
+let queuedPointerMove = null;
 let screenshotBusy = false;
 
 async function api(path, options = {}) {
@@ -211,18 +216,93 @@ function imagePoint(event) {
   };
 }
 
-$('screen').addEventListener('mousedown', (event) => { dragStart = imagePoint(event); });
-$('screen').addEventListener('mouseup', async (event) => {
+async function flushPointerMove(point) {
+  if (pointerMoveBusy) { queuedPointerMove = point; return; }
+  pointerMoveBusy = true;
+  try {
+    await api('/pointer/move', {method: 'POST', body: body(point)});
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    pointerMoveBusy = false;
+    if (queuedPointerMove) {
+      const next = queuedPointerMove;
+      queuedPointerMove = null;
+      flushPointerMove(next);
+    }
+  }
+}
+
+function renderDragMode() {
+  $('dragMode').textContent = dragMode ? 'Drag: On' : 'Drag: Off';
+  $('dragMode').setAttribute('aria-pressed', dragMode ? 'true' : 'false');
+  $('screen').style.cursor = dragMode ? 'grab' : 'crosshair';
+  $('coords').textContent = dragMode
+    ? 'Drag mode: drag directly on the screenshot.'
+    : 'Click mode: click normally. Enable Drag only when needed.';
+}
+
+$('dragMode').addEventListener('click', () => {
+  if (activeDrag) {
+    setStatus('Finish the current drag before changing mode.', true);
+    return;
+  }
+  dragMode = !dragMode;
+  renderDragMode();
+});
+
+$('screen').addEventListener('pointerdown', async (event) => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  dragStart = imagePoint(event);
+  activeDrag = dragMode;
+  $('screen').setPointerCapture(event.pointerId);
+  if (!activeDrag) return;
+  try {
+    await api('/pointer/down', {method: 'POST', body: body(dragStart)});
+  } catch (error) {
+    dragStart = null;
+    activeDrag = false;
+    setStatus(error.message, true);
+  }
+});
+
+$('screen').addEventListener('pointermove', (event) => {
+  if (!dragStart) return;
+  const point = imagePoint(event);
+  $('coords').textContent = `${point.x}, ${point.y}`;
+  if (activeDrag) flushPointerMove(point);
+});
+
+$('screen').addEventListener('pointerup', async (event) => {
   if (!dragStart) return;
   const end = imagePoint(event);
-  const distance = Math.hypot(end.x - dragStart.x, end.y - dragStart.y);
-  $('coords').textContent = `${end.x}, ${end.y}`;
+  const wasDrag = activeDrag;
+  dragStart = null;
+  activeDrag = false;
+  queuedPointerMove = null;
   try {
-    if (distance < 8) await api('/click', {method: 'POST', body: body(end)});
-    else await api('/drag', {method: 'POST', body: body({from: dragStart, to: end, duration_ms: 500})});
+    if (wasDrag) {
+      await api('/pointer/up', {method: 'POST', body: body(end)});
+    } else {
+      await api('/click', {method: 'POST', body: body(end)});
+    }
     await refreshScreenshot();
   } catch (error) { setStatus(error.message, true); }
+  renderDragMode();
+});
+
+$('screen').addEventListener('pointercancel', async () => {
+  if (!dragStart) return;
+  const wasDrag = activeDrag;
   dragStart = null;
+  activeDrag = false;
+  queuedPointerMove = null;
+  if (wasDrag) {
+    try { await api('/pointer/cancel', {method: 'POST', body: '{}'}); }
+    catch (error) { setStatus(error.message, true); }
+  }
+  renderDragMode();
 });
 
 $('go').addEventListener('click', async () => {
@@ -256,6 +336,7 @@ $('snapshot').addEventListener('click', async () => {
 });
 
 window.addEventListener('load', async () => {
+  renderDragMode();
   try { await refreshMeta(); await refreshScreenshot(); setStatus('connected'); }
   catch (error) { setStatus(error.message, true); }
 });

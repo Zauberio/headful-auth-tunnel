@@ -164,6 +164,47 @@ def test_body_limit_returns_413(make_config):
         thread.join(timeout=5)
 
 
+def test_interactive_pointer_drag_preserves_down_move_up_sequence(make_config):
+    session = BrowserSession(make_config())
+    page = FakePage(url="https://ok.test/")
+    page.frames = []
+    calls = []
+    page.mouse = types.SimpleNamespace(
+        move=lambda x, y, steps=None: calls.append(("move", x, y, steps)),
+        down=lambda: calls.append(("down",)),
+        up=lambda: calls.append(("up",)),
+    )
+    session.page = page
+    session.context = types.SimpleNamespace(pages=[page])
+
+    class Policy:
+        def validate(self, url, *, allow_non_network=False, refresh=False):
+            return NavigationDecision(True, "ok", url)
+
+    session.policy = Policy()
+    session.pointer_down(100, 120)
+    session.pointer_move(140, 120)
+    session.pointer_move(180, 120)
+    session.pointer_up(220, 120)
+
+    assert calls == [
+        ("move", 100, 120, None),
+        ("down",),
+        ("move", 140, 120, None),
+        ("move", 180, 120, None),
+        ("move", 220, 120, None),
+        ("up",),
+    ]
+    assert session._pointer_down is False
+
+
+def test_pointer_move_requires_active_drag(make_config):
+    session = BrowserSession(make_config())
+    with pytest.raises(RequestError) as excinfo:
+        session.pointer_move(100, 100)
+    assert excinfo.value.status == 409
+
+
 def test_session_store_expiry(monkeypatch):
     now = int(time.time())
     monkeypatch.setattr(time, "time", lambda: now)
@@ -671,6 +712,46 @@ def test_unreadable_frame_url_is_quarantined(make_config):
     page = FakePage(url="https://ok.test/")
 
     session._on_frame_navigated(_UnreadableFrame(page))
+
+    assert page.goto_calls == ["about:blank"]
+
+
+def test_transient_empty_subframe_navigation_does_not_quarantine(make_config):
+    session = BrowserSession(make_config())
+    page = FakePage(url="https://ok.test/")
+    main = _Frame(page, "https://ok.test/")
+    transient = _Frame(page, "")
+    page.main_frame = main
+
+    session._on_frame_navigated(transient)
+
+    assert page.goto_calls == []
+
+
+def test_transient_empty_subframe_is_ignored_at_read_boundary(make_config):
+    session = BrowserSession(make_config())
+    page = FakePage(url="https://ok.test/")
+    main = _Frame(page, "https://ok.test/")
+    transient = _Frame(page, "")
+    page.main_frame = main
+    page.frames = [main, transient]
+
+    class Policy:
+        def validate(self, url, *, allow_non_network=False, refresh=False):
+            return NavigationDecision(True, "ok", url)
+
+    session.policy = Policy()
+    assert session._check_final_url(page) == "https://ok.test/"
+    assert page.goto_calls == []
+
+
+def test_empty_main_frame_still_fails_closed(make_config):
+    session = BrowserSession(make_config())
+    page = FakePage(url="https://ok.test/")
+    main = _Frame(page, "")
+    page.main_frame = main
+
+    session._on_frame_navigated(main)
 
     assert page.goto_calls == ["about:blank"]
 

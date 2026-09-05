@@ -54,6 +54,7 @@ class BrowserSession:
         self._frame_dns_origins: set[str] = set()
         self._frame_dns_window_seconds = 5.0
         self._frame_dns_max_events = config.dns_validation_max_events
+        self._pointer_down = False
         self._read_frame_limit = 64
         self._quarantining_pages: set[int] = set()
 
@@ -284,24 +285,40 @@ class BrowserSession:
         self._frame_dns_events += 1
         return True, True
 
-    def _quarantine_page(self, page, log_message: str) -> None:
+    def _quarantine_page(self, page, reason: str) -> None:
         key = id(page)
         if key in self._quarantining_pages:
             return
         self._quarantining_pages.add(key)
         try:
+            try:
+                current_url = page.url or "<empty>"
+            except Exception:
+                current_url = "<unreadable>"
+            LOGGER.warning("Quarantining page %s: %s", current_url, reason)
             page.goto("about:blank")
         except Exception:
-            LOGGER.exception(log_message)
+            LOGGER.exception("Failed to quarantine page after: %s", reason)
         finally:
             self._quarantining_pages.discard(key)
+
+    @staticmethod
+    def _is_main_frame(page, frame) -> bool:
+        try:
+            return frame == page.main_frame
+        except Exception:
+            pass
+        try:
+            return frame.parent_frame is None
+        except Exception:
+            return True
 
     def _dns_refresh_or_block(self, page, url: str, reason: str) -> bool:
         allowed, refresh_dns = self._reserve_dns_refresh(url)
         if allowed:
             return refresh_dns
         LOGGER.warning("Blocked browser access: DNS validation budget exceeded")
-        self._quarantine_page(page, "Failed to quarantine page after DNS budget exhaustion")
+        self._quarantine_page(page, "DNS validation budget exceeded")
         raise RequestError(403, reason)
 
     def _on_frame_navigated(self, frame) -> None:
@@ -320,8 +337,11 @@ class BrowserSession:
             url = ""
 
         if not url:
-            LOGGER.warning("Blocked frame navigation: final URL could not be determined")
-            self._quarantine_page(page, "Failed to quarantine frame with unreadable URL")
+            if not self._is_main_frame(page, frame):
+                LOGGER.debug("Ignoring transient subframe with no committed URL")
+                return
+            LOGGER.warning("Blocked main-frame navigation: final URL could not be determined")
+            self._quarantine_page(page, "main-frame URL could not be determined")
             return
 
         budget_allowed, refresh_dns = self._reserve_dns_refresh(url)
@@ -329,7 +349,7 @@ class BrowserSession:
             LOGGER.warning("Blocked frame navigation: DNS validation budget exceeded")
             self._quarantine_page(
                 page,
-                "Failed to quarantine page after DNS budget exhaustion",
+                "DNS validation budget exceeded",
             )
             return
 
@@ -341,14 +361,14 @@ class BrowserSession:
             )
         except Exception:
             LOGGER.exception("Frame navigation validation failed")
-            self._quarantine_page(page, "Failed to quarantine frame after validation error")
+            self._quarantine_page(page, "frame navigation validation failed")
             return
 
         if decision.allowed:
             return
 
         LOGGER.warning("Blocked frame navigation to %s: %s", url, decision.reason)
-        self._quarantine_page(page, "Failed to quarantine frame-blocked page")
+        self._quarantine_page(page, "frame navigation was blocked by policy")
 
     def _pages(self) -> list[Any]:
         if self.backend is not None:
@@ -492,14 +512,14 @@ class BrowserSession:
         """
         url = self._final_url(page)
         if not url:
-            self._quarantine_page(page, "Failed to quarantine page with unreadable URL")
+            self._quarantine_page(page, "final page URL could not be determined")
             raise RequestError(403, "Blocked: could not determine final URL")
         refresh_dns = self._dns_refresh_or_block(
             page, url, "Blocked: DNS validation budget exceeded"
         )
         decision = self.policy.validate(url, allow_non_network=True, refresh=refresh_dns)
         if not decision.allowed:
-            self._quarantine_page(page, "Failed to quarantine blocked page")
+            self._quarantine_page(page, "final page URL was blocked by policy")
             raise RequestError(403, f"Redirected to blocked host: {decision.reason}")
 
         try:
@@ -507,11 +527,11 @@ class BrowserSession:
         except Exception:
             self._quarantine_page(
                 page,
-                "Failed to quarantine page with unreadable frame inventory",
+                "page frame inventory could not be inspected",
             )
             raise RequestError(403, "Blocked: could not inspect page frames") from None
         if len(frames) > self._read_frame_limit:
-            self._quarantine_page(page, "Failed to quarantine page with excessive frame count")
+            self._quarantine_page(page, "page exceeded the frame-count limit")
             raise RequestError(403, "Blocked: page has too many frames")
 
         for frame in frames:
@@ -520,9 +540,12 @@ class BrowserSession:
             except Exception:
                 frame_url = ""
             if not frame_url:
+                if not self._is_main_frame(page, frame):
+                    LOGGER.debug("Ignoring transient subframe with no committed URL")
+                    continue
                 self._quarantine_page(
                     page,
-                    "Failed to quarantine page with unreadable frame URL",
+                    "main-frame URL could not be determined during frame sweep",
                 )
                 raise RequestError(403, "Blocked: could not determine frame URL")
             refresh_dns = self._dns_refresh_or_block(
@@ -534,7 +557,7 @@ class BrowserSession:
                 refresh=refresh_dns,
             )
             if not frame_decision.allowed:
-                self._quarantine_page(page, "Failed to quarantine page with blocked frame")
+                self._quarantine_page(page, "subframe URL was blocked by policy")
                 raise RequestError(403, f"Frame blocked: {frame_decision.reason}")
 
         return decision.normalized_url or url
@@ -590,6 +613,46 @@ class BrowserSession:
         self._check_final_url(page)
         page.mouse.click(x, y)
         self._check_final_url(page)
+        return {"ok": True}
+
+    def pointer_down(self, x: int, y: int) -> dict[str, bool]:
+        x, y = self._point(x, y)
+        page = self._current_page()
+        self._check_final_url(page)
+        page.mouse.move(x, y)
+        page.mouse.down()
+        self._pointer_down = True
+        return {"ok": True}
+
+    def pointer_move(self, x: int, y: int) -> dict[str, bool]:
+        if not self._pointer_down:
+            raise RequestError(409, "Pointer is not down")
+        x, y = self._point(x, y)
+        page = self._current_page()
+        page.mouse.move(x, y)
+        return {"ok": True}
+
+    def pointer_up(self, x: int, y: int) -> dict[str, bool]:
+        if not self._pointer_down:
+            raise RequestError(409, "Pointer is not down")
+        x, y = self._point(x, y)
+        page = self._current_page()
+        try:
+            page.mouse.move(x, y)
+            page.mouse.up()
+        finally:
+            self._pointer_down = False
+        self._check_final_url(page)
+        return {"ok": True}
+
+    def pointer_cancel(self) -> dict[str, bool]:
+        if not self._pointer_down:
+            return {"ok": True}
+        page = self._current_page()
+        try:
+            page.mouse.up()
+        finally:
+            self._pointer_down = False
         return {"ok": True}
 
     def drag(
@@ -1055,6 +1118,26 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                     x=int(body.get("x", -1)),
                     y=int(body.get("y", -1)),
                 )
+            elif path == "/pointer/down":
+                result = controller.call(
+                    "pointer_down",
+                    x=int(body.get("x", -1)),
+                    y=int(body.get("y", -1)),
+                )
+            elif path == "/pointer/move":
+                result = controller.call(
+                    "pointer_move",
+                    x=int(body.get("x", -1)),
+                    y=int(body.get("y", -1)),
+                )
+            elif path == "/pointer/up":
+                result = controller.call(
+                    "pointer_up",
+                    x=int(body.get("x", -1)),
+                    y=int(body.get("y", -1)),
+                )
+            elif path == "/pointer/cancel":
+                result = controller.call("pointer_cancel")
             elif path == "/drag":
                 start = body.get("from") or {}
                 end = body.get("to") or {}

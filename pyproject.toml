@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "headful-auth-tunnel"
-version = "0.4.4"
+version = "0.4.5"
 description = "LAN/VPN remote-control tunnel for human-operated headful browser sessions with persistent profiles."
 readme = "README.md"
 requires-python = ">=3.10"

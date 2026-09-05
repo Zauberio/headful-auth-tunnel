@@ -27,3 +27,15 @@ def test_ui_labels_text_entry_button_send():
 
     assert '<button id="type">Send</button>' in APP_HTML
     assert '<button id="type">Type</button>' not in APP_HTML
+
+
+def test_ui_has_explicit_drag_mode_toggle():
+    from headful_auth_tunnel.ui import APP_HTML, APP_JS
+
+    assert (
+        '<button id="dragMode" class="secondary" aria-pressed="false">Drag: Off</button>'
+        in APP_HTML
+    )
+    assert "if (wasDrag)" in APP_JS
+    assert "await api('/click'" in APP_JS
+    assert "await api('/pointer/up'" in APP_JS

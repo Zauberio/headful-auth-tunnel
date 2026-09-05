@@ -181,7 +181,7 @@ The web UI is a live view of the complete headful browser. Login pages, password
 
 Browser ownership depends on the backend. In `managed` mode, one tunnel process owns one live Chromium context and reuses `PROFILE_DIR` across restarts. In `cdp` mode, Chromium and its profile remain owned by an external service; the tunnel attaches to one selected tab and never closes the external browser. In both modes, every HTTP/UI action is serialized through the same browser worker thread.
 
-The UI supports direct click/drag, navigation, text sending, key presses, viewport changes, tab selection and selector-based editing. The visible text-entry button is labelled **Send**; API compatibility remains `POST /type`.
+The UI supports direct click/drag, navigation, text sending, key presses, viewport changes, tab selection and selector-based editing. **Drag: Off** is the default and uses the stable single-click path for normal controls; enable **Drag: On** only when a continuous pointer gesture is needed, such as a human-operated slider. The visible text-entry button is labelled **Send**; API compatibility remains `POST /type`.
 
 Authenticated API operations include:
 
@@ -194,7 +194,8 @@ Authenticated API operations include:
 | `POST` | `/page` | Add `include_values` and optionally `include_sensitive_values`. |
 | `POST` | `/navigate` | Navigate to a policy-approved URL. |
 | `POST` | `/viewport` | Change viewport width and height. |
-| `POST` | `/click`, `/drag` | Pointer control. |
+| `POST` | `/click`, `/drag` | Single click and compatibility drag control. |
+| `POST` | `/pointer/down`, `/pointer/move`, `/pointer/up`, `/pointer/cancel` | Interactive pointer sequence used by explicit Drag mode. |
 | `POST` | `/type`, `/key` | Keyboard control. |
 | `POST` | `/tabs/focus`, `/tabs/close` | Tab control. |
 | `POST` | `/dom/fill`, `/dom/click` | Selector editing. |

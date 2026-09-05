@@ -200,3 +200,33 @@ The final remaining tab cannot be closed.
 ```
 
 These helpers act on the first matching element and use a 10-second operation timeout.
+
+## `POST /pointer/down`
+
+Begin an interactive left-button pointer gesture at screenshot coordinates. Used by explicit **Drag mode** in the web UI.
+
+```json
+{"x": 640, "y": 420}
+```
+
+## `POST /pointer/move`
+
+Move an already-active interactive pointer gesture. Returns `409` when no pointer gesture is active.
+
+```json
+{"x": 720, "y": 420}
+```
+
+## `POST /pointer/up`
+
+Move to the final coordinates and release the active pointer gesture.
+
+```json
+{"x": 800, "y": 420}
+```
+
+## `POST /pointer/cancel`
+
+Release an active pointer gesture without further movement.
+
+The web UI keeps **Drag: Off** by default so ordinary buttons, menus and dropdowns continue to use `POST /click`; enable Drag mode only for continuous human pointer gestures.
