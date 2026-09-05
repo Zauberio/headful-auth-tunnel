@@ -160,6 +160,7 @@ def test_invalid_connection_cap_is_rejected(monkeypatch, tmp_path, value):
     with pytest.raises(ValueError, match="MAX_CONCURRENT_CONNECTIONS"):
         Config.from_env()
 
+
 def test_existing_complete_token_is_adopted(monkeypatch, tmp_path):
     clear_env(monkeypatch)
     token_file = tmp_path / "token"
@@ -240,4 +241,3 @@ def test_concurrent_first_starts_share_persisted_token(monkeypatch, tmp_path):
     assert len(persisted) >= 24
     assert {cfg.auth_token for cfg in configs} == {persisted}
     assert all(cfg.token_file == token_file for cfg in configs)
-
