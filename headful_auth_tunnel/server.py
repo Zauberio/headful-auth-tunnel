@@ -880,6 +880,9 @@ class BrowserController:
 def make_handler(config: Config, controller: BrowserController, sessions: SessionStore):
     class Handler(BaseHTTPRequestHandler):
         server_version = f"HeadfulAuthTunnel/{__version__}"
+        # Keep the app version (maintainer #26). Strip the stdlib Python
+        # version so unauthenticated responses do not leak the interpreter.
+        sys_version = ""
 
         def setup(self) -> None:
             super().setup()
@@ -938,7 +941,10 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
             self.send_response(status)
             self._headers(content_type, len(payload), extra)
             self.end_headers()
-            self.wfile.write(payload)
+            # HEAD must not emit a body (RFC 9110 §9.3.2); Content-Length
+            # still advertises what GET would return.
+            if self.command != "HEAD":
+                self.wfile.write(payload)
 
         def _send_text(
             self,
@@ -1032,6 +1038,75 @@ def make_handler(config: Config, controller: BrowserController, sessions: Sessio
                 return
             LOGGER.exception("Request failed")
             self._send_json(500, {"error": "Internal server error"})
+
+        def _allowed_methods(self, path: str) -> str | None:
+            get_paths = {
+                "/",
+                "/app.css",
+                "/app.js",
+                "/health",
+                "/meta",
+                "/page",
+                "/screenshot",
+                "/tabs",
+            }
+            post_paths = {
+                "/click",
+                "/dom/click",
+                "/dom/fill",
+                "/dom/press",
+                "/dom/select",
+                "/drag",
+                "/history/back",
+                "/history/forward",
+                "/key",
+                "/logout",
+                "/navigate",
+                "/page",
+                "/reload",
+                "/session",
+                "/tabs/close",
+                "/tabs/focus",
+                "/type",
+                "/viewport",
+            }
+            methods: list[str] = []
+            if path in get_paths:
+                methods.extend(["GET", "HEAD"])
+            if path in post_paths:
+                methods.append("POST")
+            if not methods:
+                return None
+            return ", ".join(methods)
+
+        def do_HEAD(self) -> None:
+            # RFC 9110 §9.3.2: servers MUST support HEAD wherever GET is
+            # supported, and it must be identical to GET minus the body.
+            try:
+                self._do_GET()
+            except BaseException as exc:
+                self._handle_error(exc)
+
+        def do_OPTIONS(self) -> None:
+            try:
+                allow = self._allowed_methods(urlsplit(self.path).path)
+                if allow is None:
+                    self._send_json(404, {"error": "Not found"})
+                    return
+                self._send_bytes(204, b"", "text/plain; charset=utf-8", {"Allow": allow})
+            except BaseException as exc:
+                self._handle_error(exc)
+
+        def do_TRACE(self) -> None:
+            # TRACE is disabled (XST hardening; TRACE is never listed in Allow).
+            try:
+                allow = self._allowed_methods(urlsplit(self.path).path)
+                if allow is None:
+                    self._send_json(404, {"error": "Not found"})
+                    return
+                self._send_bytes(405, b"", "text/plain; charset=utf-8", {"Allow": allow})
+            except BaseException as exc:
+                self._handle_error(exc)
 
         def do_GET(self) -> None:
             try:
