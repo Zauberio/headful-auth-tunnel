@@ -2,7 +2,26 @@
 set -eu
 
 ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-RUNTIME_DIR=${RUNTIME_DIR:-$ROOT_DIR/runtime}
+if [ -f "$ROOT_DIR/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$ROOT_DIR/.env"
+  set +a
+fi
+# Must stay in sync with scripts/run-foreground.sh and the systemd unit.
+# When RUNTIME_DIR is unset, probe the same writable fallback locations so a
+# standalone stop.sh can find a foreground service started under systemd.
+if [ -z "${RUNTIME_DIR:-}" ]; then
+  if [ -d "$ROOT_DIR/runtime" ] && [ -w "$ROOT_DIR/runtime" ]; then
+    RUNTIME_DIR=$ROOT_DIR/runtime
+  elif [ -d /var/lib/headful-auth-tunnel ] && [ -w /var/lib/headful-auth-tunnel ]; then
+    RUNTIME_DIR=/var/lib/headful-auth-tunnel
+  elif [ -d /run/headful-auth-tunnel ] && [ -w /run/headful-auth-tunnel ]; then
+    RUNTIME_DIR=/run/headful-auth-tunnel
+  else
+    RUNTIME_DIR=$ROOT_DIR/runtime
+  fi
+fi
 PID_FILE=${PID_FILE:-$RUNTIME_DIR/tunnel.pid}
 XVFB_PID_FILE=${XVFB_PID_FILE:-$RUNTIME_DIR/xvfb.pid}
 
@@ -34,5 +53,7 @@ stop_owned_process() {
   echo "Stopped $label (pid $pid)"
 }
 
-stop_owned_process "$PID_FILE" "headful" "Headful Auth Tunnel"
-stop_owned_process "$XVFB_PID_FILE" "Xvfb" "Xvfb"
+# set -e would abort the script on a refusal, orphaning Xvfb; run both and
+# still clean up. Refusal exits 0 after removing the stale pid file.
+stop_owned_process "$PID_FILE" "headful" "Headful Auth Tunnel" || true
+stop_owned_process "$XVFB_PID_FILE" "Xvfb" "Xvfb" || true
