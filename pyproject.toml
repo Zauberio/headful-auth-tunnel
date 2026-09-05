@@ -28,7 +28,11 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
   "Topic :: Internet :: WWW/HTTP :: Browsers",
 ]
-dependencies = ["playwright>=1.48,<2", "scrapling[fetchers]>=0.4.8,<0.5"]
+dependencies = [
+  "playwright>=1.48,<2",
+  "scrapling[fetchers]>=0.4.8,<0.5",
+  "idna>=3.4,<4",
+]
 
 [project.optional-dependencies]
 dev = [
